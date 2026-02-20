@@ -16,7 +16,6 @@ package io.trino.tests.product.hive;
 import io.trino.testing.containers.environment.ProductTest;
 import io.trino.testing.containers.environment.QueryResult;
 import io.trino.testing.containers.environment.RequiresEnvironment;
-import io.trino.tests.product.TestGroup;
 import io.trino.testing.containers.environment.Row;
 import io.trino.tests.product.TestGroup;
 import org.assertj.core.api.AbstractStringAssert;
@@ -46,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @ProductTest
 @RequiresEnvironment(HiveIcebergRedirectionsEnvironment.class)
+@TestGroup.HiveIcebergRedirections
 class TestHiveRedirectionToIceberg
 {
     @Test
