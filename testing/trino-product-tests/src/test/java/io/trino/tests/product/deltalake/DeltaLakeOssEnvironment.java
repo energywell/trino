@@ -86,7 +86,8 @@ public class DeltaLakeOssEnvironment
         // Start Spark with Delta Lake (depends on Hadoop for HMS)
         spark = new SparkDeltaContainer()
                 .withNetwork(network)
-                .withNetworkAliases(SparkDeltaContainer.HOST_NAME);
+                .withNetworkAliases(SparkDeltaContainer.HOST_NAME)
+                .build();
         spark.dependsOn(hadoop);
         spark.start();
 
@@ -222,5 +223,17 @@ public class DeltaLakeOssEnvironment
     public String getWarehouseDirectory()
     {
         return hadoop.getWarehouseDirectory();
+    }
+
+    static void main(String[] args)
+    {
+        try (DeltaLakeOssEnvironment environment = new DeltaLakeOssEnvironment()) {
+            environment.start();
+            System.out.println("DeltaLakeOssEnvironment started. Press Ctrl+C to stop.");
+            Thread.sleep(Long.MAX_VALUE);
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

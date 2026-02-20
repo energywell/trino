@@ -28,32 +28,33 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * Delta Lake product test environment with S3-compatible storage (Minio).
+ * Hive and Delta Lake product test environment with S3-compatible storage (Minio)
+ * and table redirections enabled.
  * <p>
  * This environment provides:
  * <ul>
  *   <li>Minio container providing S3-compatible object storage</li>
  *   <li>Hadoop container for Hive Metastore only (HDFS is not used)</li>
  *   <li>Spark container with Delta Lake support and Thrift Server configured for S3</li>
- *   <li>Trino container with Delta Lake connector configured for S3 (Minio)</li>
+ *   <li>Trino container with both Hive and Delta Lake connectors configured for S3 (Minio)</li>
  * </ul>
  * <p>
  * Catalog configuration:
  * <ul>
  *   <li>Trino uses "delta" catalog for Delta Lake tables stored in Minio (S3)</li>
+ *   <li>Trino uses "hive" catalog for Hive tables, with delta_lake_catalog_name=delta for redirections</li>
  *   <li>Spark uses "spark_catalog" with DeltaCatalog, also configured for S3 (Minio)</li>
- *   <li>Both share the same Hive Metastore for table metadata and the same S3 storage</li>
+ *   <li>All share the same Hive Metastore for table metadata and the same S3 storage</li>
  * </ul>
  * <p>
- * This environment enables full Spark-Trino interoperability testing where both
- * engines read and write to the same S3 storage location.
+ * This environment enables testing of Hive-to-Delta Lake table redirections, where Delta Lake
+ * tables accessed through the Hive catalog are automatically redirected to the Delta Lake
+ * catalog for proper handling.
  */
-public class DeltaLakeMinioEnvironment
+public class HiveDeltaLakeMinioEnvironment
         extends ProductTestEnvironment
 {
     static {
@@ -67,14 +68,13 @@ public class DeltaLakeMinioEnvironment
         }
     }
 
-    private static final String BUCKET_NAME = "delta-test-bucket";
+    private static final String BUCKET_NAME = "delta-hive-redirect-bucket";
 
     private Network network;
     private Minio minio;
     private HadoopContainer hadoop;
     private SparkDeltaContainer spark;
     private TrinoContainer trino;
-    private final List<MinioClient> openMinioClients = new CopyOnWriteArrayList<>();
 
     @Override
     public void start()
@@ -120,39 +120,35 @@ public class DeltaLakeMinioEnvironment
         spark.start();
 
         String metastoreUri = "thrift://" + HadoopContainer.HOST_NAME + ":" + HadoopContainer.HIVE_METASTORE_PORT;
-        String s3Endpoint = "http://" + Minio.DEFAULT_HOST_NAME + ":" + Minio.MINIO_API_PORT;
 
-        // Start Trino with Delta Lake and Hive connectors configured for S3 (Minio)
-        // Configuration matches the original singlenode-delta-lake-oss environment
+        // Start Trino with both Hive and Delta Lake connectors configured for S3 (Minio)
+        // Bi-directional redirections: Hive redirects Delta Lake tables to delta catalog,
+        // and Delta Lake redirects Hive tables to hive catalog
         trino = TrinoProductTestContainer.builder()
                 .withNetwork(network)
-                .withCatalog("delta", Map.ofEntries(
-                        Map.entry("connector.name", "delta_lake"),
-                        Map.entry("hive.metastore.uri", metastoreUri),
-                        Map.entry("fs.native-s3.enabled", "true"),
-                        Map.entry("fs.hadoop.enabled", "false"),
-                        Map.entry("s3.endpoint", s3Endpoint),
-                        Map.entry("s3.aws-access-key", Minio.MINIO_ROOT_USER),
-                        Map.entry("s3.aws-secret-key", Minio.MINIO_ROOT_PASSWORD),
-                        Map.entry("s3.path-style-access", "true"),
-                        Map.entry("s3.region", Minio.MINIO_REGION),
-                        Map.entry("delta.enable-non-concurrent-writes", "true"),
-                        Map.entry("delta.hive-catalog-name", "hive")))
+                .withCatalog("delta", Map.of(
+                        "connector.name", "delta_lake",
+                        "hive.metastore.uri", metastoreUri,
+                        "fs.native-s3.enabled", "true",
+                        "s3.endpoint", "http://" + Minio.DEFAULT_HOST_NAME + ":" + Minio.MINIO_API_PORT,
+                        "s3.aws-access-key", Minio.MINIO_ROOT_USER,
+                        "s3.aws-secret-key", Minio.MINIO_ROOT_PASSWORD,
+                        "s3.path-style-access", "true",
+                        "s3.region", Minio.MINIO_REGION,
+                        "delta.hive-catalog-name", "hive"))
                 .withCatalog("hive", Map.ofEntries(
                         Map.entry("connector.name", "hive"),
                         Map.entry("hive.metastore.uri", metastoreUri),
                         Map.entry("hive.non-managed-table-writes-enabled", "true"),
                         Map.entry("fs.native-s3.enabled", "true"),
-                        Map.entry("fs.hadoop.enabled", "false"),
-                        Map.entry("s3.endpoint", s3Endpoint),
+                        Map.entry("s3.endpoint", "http://" + Minio.DEFAULT_HOST_NAME + ":" + Minio.MINIO_API_PORT),
                         Map.entry("s3.aws-access-key", Minio.MINIO_ROOT_USER),
                         Map.entry("s3.aws-secret-key", Minio.MINIO_ROOT_PASSWORD),
                         Map.entry("s3.path-style-access", "true"),
                         Map.entry("s3.region", Minio.MINIO_REGION),
                         Map.entry("hive.hive-views.enabled", "true"),
-                        Map.entry("hive.delta-lake-catalog-name", "delta"),
-                        Map.entry("hive.parquet.time-zone", "UTC"),
-                        Map.entry("hive.rcfile.time-zone", "UTC")))
+                        Map.entry("hive.delta-lake-catalog-name", "delta")))
+                .withCatalog("tpch", Map.of("connector.name", "tpch"))
                 .build();
         trino.start();
 
@@ -189,7 +185,7 @@ public class DeltaLakeMinioEnvironment
             return QueryResult.forResultSet(rs);
         }
         catch (SQLException e) {
-            throw new RuntimeException("Failed to execute Spark query: " + sql + ". " + formatSqlException(e), e);
+            throw new RuntimeException("Failed to execute Spark query: " + sql, e);
         }
     }
 
@@ -206,13 +202,8 @@ public class DeltaLakeMinioEnvironment
             return stmt.executeUpdate(sql);
         }
         catch (SQLException e) {
-            throw new RuntimeException("Failed to execute Spark update: " + sql + ". " + formatSqlException(e), e);
+            throw new RuntimeException("Failed to execute Spark update: " + sql, e);
         }
-    }
-
-    private static String formatSqlException(SQLException e)
-    {
-        return "SQLState=" + e.getSQLState() + ", ErrorCode=" + e.getErrorCode() + ", Message=" + e.getMessage();
     }
 
     // Minio access
@@ -226,9 +217,7 @@ public class DeltaLakeMinioEnvironment
      */
     public MinioClient createMinioClient()
     {
-        MinioClient client = minio.createMinioClient();
-        openMinioClients.add(client);
-        return client;
+        return minio.createMinioClient();
     }
 
     /**
@@ -253,7 +242,7 @@ public class DeltaLakeMinioEnvironment
     @Override
     public String getTrinoJdbcUrl()
     {
-        return trino.getJdbcUrl();
+        return trino != null ? trino.getJdbcUrl() : null;
     }
 
     @Override
@@ -263,27 +252,8 @@ public class DeltaLakeMinioEnvironment
     }
 
     @Override
-    protected void afterEachTest()
-    {
-        closeOpenMinioClients();
-    }
-
-    private void closeOpenMinioClients()
-    {
-        for (MinioClient client : openMinioClients) {
-            try {
-                client.close();
-            }
-            catch (Exception ignored) {
-            }
-        }
-        openMinioClients.clear();
-    }
-
-    @Override
     protected void doClose()
     {
-        closeOpenMinioClients();
         if (trino != null) {
             trino.close();
             trino = null;
