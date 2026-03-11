@@ -18,6 +18,7 @@ import io.airlift.bootstrap.Bootstrap;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorContext;
 import io.trino.spi.connector.ConnectorFactory;
+import io.trino.spi.type.TypeManager;
 
 import java.util.Map;
 
@@ -36,7 +37,9 @@ public class StarrocksConnctorFactory
     public Connector create(String catalogName, Map<String, String> config, ConnectorContext context)
     {
         requireNonNull(config, "config is null");
-        Bootstrap app = new Bootstrap(new StarrocksModule());
+        Bootstrap app = new Bootstrap(
+                binder -> binder.bind(TypeManager.class).toInstance(context.getTypeManager()),
+                new StarrocksModule(catalogName));
         Injector injector = app
                 .doNotInitializeLogging()
                 .setRequiredConfigurationProperties(config)

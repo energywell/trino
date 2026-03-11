@@ -16,25 +16,33 @@ package io.trino.plugin.starrocks;
 import com.google.inject.Binder;
 import com.google.inject.Module;
 import com.google.inject.Scopes;
+import io.trino.spi.connector.ConnectorPageSinkProvider;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSplitManager;
 
 import static io.airlift.configuration.ConfigBinder.configBinder;
+import static java.util.Objects.requireNonNull;
 
 public class StarrocksModule
         implements Module
 {
-    public StarrocksModule()
+    private final String catalogName;
+
+    public StarrocksModule(String catalogName)
     {
+        this.catalogName = requireNonNull(catalogName, "catalogName is null");
     }
 
     @Override
     public void configure(Binder binder)
     {
+        binder.bind(StarrocksCatalogName.class).toInstance(new StarrocksCatalogName(catalogName));
         binder.bind(StarrocksConnctor.class).in(Scopes.SINGLETON);
         binder.bind(StarrocksClient.class).in(Scopes.SINGLETON);
+        binder.bind(StarrocksTypeMapper.class).in(Scopes.SINGLETON);
         binder.bind(ConnectorSplitManager.class).to(StarrocksSplitManager.class).in(Scopes.SINGLETON);
         binder.bind(ConnectorPageSourceProvider.class).to(StarrocksPageSourceProvider.class).in(Scopes.SINGLETON);
+        binder.bind(ConnectorPageSinkProvider.class).to(StarrocksPageSinkProvider.class).in(Scopes.SINGLETON);
         binder.bind(StarrocksSessionProperties.class).in(Scopes.SINGLETON);
         binder.bind(StarrocksTableProperties.class).in(Scopes.SINGLETON);
         configBinder(binder).bindConfig(StarrocksConfig.class);

@@ -32,11 +32,13 @@ public class StarrocksPageSourceProvider
         implements ConnectorPageSourceProvider
 {
     private final StarrocksClient client;
+    private final StarrocksTypeMapper typeMapper;
 
     @Inject
-    public StarrocksPageSourceProvider(StarrocksClient client)
+    public StarrocksPageSourceProvider(StarrocksClient client, StarrocksTypeMapper typeMapper)
     {
         this.client = requireNonNull(client, "client is null");
+        this.typeMapper = requireNonNull(typeMapper, "typeMapper is null");
     }
 
     @Override
@@ -53,6 +55,6 @@ public class StarrocksPageSourceProvider
         StarrocksBeReader beReader = new StarrocksBeReader(client.getConfig(), starrocksSplit.getBeNode(), columns, table.getSchemaTableName());
         beReader.openScanner(starrocksSplit.getTabletId(), starrocksSplit.getOpaquedQueryPlan());
 
-        return new StarrocksPageSource(beReader, columns);
+        return new StarrocksPageSource(beReader, columns, typeMapper);
     }
 }

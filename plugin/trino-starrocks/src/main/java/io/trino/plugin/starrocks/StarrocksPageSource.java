@@ -37,6 +37,7 @@ public class StarrocksPageSource
         implements ConnectorPageSource
 {
     private final StarrocksBeReader beReader;
+    private final StarrocksTypeMapper typeMapper;
     private final List<StarrocksColumnHandle> columnHandles;
     private final List<Type> types;
 
@@ -46,14 +47,15 @@ public class StarrocksPageSource
     private ArrowStreamReader currentArrowReader;
     private RootAllocator rootAllocator;
 
-    public StarrocksPageSource(StarrocksBeReader beReader, List<ColumnHandle> columns)
+    public StarrocksPageSource(StarrocksBeReader beReader, List<ColumnHandle> columns, StarrocksTypeMapper typeMapper)
     {
         this.beReader = requireNonNull(beReader, "beReader is null");
+        this.typeMapper = requireNonNull(typeMapper, "typeMapper is null");
         this.columnHandles = columns.stream()
                 .map(StarrocksColumnHandle.class::cast)
                 .collect(toImmutableList());
         this.types = columnHandles.stream()
-                .map(col -> StarrocksTypeMapper.toTrinoType(col.getType(), col.getColumnType(), col.getColumnSize(), col.getDecimalDigits()))
+                .map(col -> typeMapper.toTrinoType(col.getType(), col.getColumnType(), col.getColumnSize(), col.getDecimalDigits()))
                 .collect(toImmutableList());
         this.rootAllocator = new RootAllocator(2147483647L);
     }
@@ -164,6 +166,6 @@ public class StarrocksPageSource
 
     private BlockBuilder convert(FieldVector fieldVector, Type type, int rowCount, int dataPosition, BlockBuilder blockBuilder)
     {
-        return StarrocksTypeMapper.convert(fieldVector, type, rowCount, dataPosition, blockBuilder);
+        return typeMapper.convert(fieldVector, type, rowCount, dataPosition, blockBuilder);
     }
 }

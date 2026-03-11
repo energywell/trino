@@ -13,6 +13,8 @@
  */
 package io.trino.plugin.starrocks;
 
+import io.airlift.slice.Slice;
+import io.airlift.slice.Slices;
 import io.trino.spi.block.ArrayBlockBuilder;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.block.MapBlockBuilder;
@@ -35,7 +37,6 @@ import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
-import io.trino.type.JsonType;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DecimalVector;
@@ -64,6 +65,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+
+import static io.trino.plugin.base.util.JsonTypeUtil.jsonParse;
 
 public class ArrowConverter
 {
@@ -97,7 +100,7 @@ public class ArrowConverter
         typeConverter.put(ArrayType.class, new ArrayConverter());
         typeConverter.put(MapType.class, new MapConverter());
         typeConverter.put(RowType.class, new StructConverter());
-        typeConverter.put(JsonType.JSON.getClass(), new VarcharConverter());
+        // JSON type is handled specially in StarrocksTypeMapper.convert() to avoid classloader issues
     }
 
     static {
@@ -597,13 +600,38 @@ public class ArrowConverter
     }
 
     // json
-    private static class JsonConverter
+    static class JsonConverter
             implements ArrowFieldConverter
     {
         @Override
         public BlockBuilder convert(FieldVector vector, Type type, int rowCount, int dataPosition, BlockBuilder blockBuilder)
         {
-            return null;
+            if (blockBuilder == null) {
+                blockBuilder = type.createBlockBuilder(null, rowCount);
+            }
+            for (int i = 0; i < rowCount; i++) {
+                if (vector.isNull(i)) {
+                    blockBuilder.appendNull();
+                }
+                else {
+                    String jsonString;
+                    if (vector instanceof VarCharVector) {
+                        Text text = ((VarCharVector) vector).getObject(i);
+                        jsonString = text.toString();
+                    }
+                    else {
+                        Object obj = vector.getObject(i);
+                        if (obj == null) {
+                            blockBuilder.appendNull();
+                            continue;
+                        }
+                        jsonString = obj.toString();
+                    }
+                    Slice jsonSlice = jsonParse(Slices.utf8Slice(jsonString));
+                    type.writeSlice(blockBuilder, jsonSlice);
+                }
+            }
+            return blockBuilder;
         }
     }
 }

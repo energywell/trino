@@ -13,10 +13,12 @@
  */
 package io.trino.plugin.starrocks;
 
+import com.google.inject.Inject;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.BigintType;
 import io.trino.spi.type.BooleanType;
+import io.trino.spi.type.CharType;
 import io.trino.spi.type.DateType;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.DoubleType;
@@ -25,13 +27,15 @@ import io.trino.spi.type.MapType;
 import io.trino.spi.type.RealType;
 import io.trino.spi.type.RowType;
 import io.trino.spi.type.SmallintType;
+import io.trino.spi.type.StandardTypes;
 import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
+import io.trino.spi.type.TypeManager;
 import io.trino.spi.type.TypeOperators;
+import io.trino.spi.type.TypeSignature;
 import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
-import io.trino.type.JsonType;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
@@ -46,11 +50,21 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+import static java.util.Objects.requireNonNull;
+
 public class StarrocksTypeMapper
 {
-    private StarrocksTypeMapper() {}
+    private static final int STARROCKS_MAX_VARCHAR_LENGTH = 65533;
+    private final Type jsonType;
 
-    public static BlockBuilder convert(FieldVector fieldVector, Type type, int rowCount, int dataPosition, BlockBuilder blockBuilder)
+    @Inject
+    public StarrocksTypeMapper(TypeManager typeManager)
+    {
+        requireNonNull(typeManager, "typeManager is null");
+        this.jsonType = typeManager.getType(new TypeSignature(StandardTypes.JSON));
+    }
+
+    public BlockBuilder convert(FieldVector fieldVector, Type type, int rowCount, int dataPosition, BlockBuilder blockBuilder)
     {
         if (type instanceof DecimalType) {
             int precision = ((DecimalType) type).getPrecision();
@@ -58,6 +72,13 @@ public class StarrocksTypeMapper
             type.createBlockBuilder(null, rowCount);
             ArrowFieldConverter converter = new ArrowConverter.DynamicDecimalConverter(precision, scale);
             return converter.convert(fieldVector, type, rowCount, dataPosition, blockBuilder);
+        }
+        // JSON type must be handled specially: the TypeManager-resolved JSON type
+        // comes from Trino core's classloader, so type.getClass() lookup in the
+        // static converter map would fail due to classloader isolation.
+        if (type.getBaseName().equals(StandardTypes.JSON)) {
+            blockBuilder = type.createBlockBuilder(null, rowCount);
+            return new ArrowConverter.JsonConverter().convert(fieldVector, type, rowCount, dataPosition, blockBuilder);
         }
         ArrowFieldConverter converter = ArrowConverter.typeConverter.get(type.getClass());
         if (converter == null) {
@@ -67,7 +88,7 @@ public class StarrocksTypeMapper
         return converter.convert(fieldVector, type, rowCount, dataPosition, blockBuilder);
     }
 
-    public static Type toTrinoType(String starrocksType, String starrocksColumnType, int precision, int scale)
+    public Type toTrinoType(String starrocksType, String starrocksColumnType, int precision, int scale)
     {
         String toLowerString = starrocksType.toLowerCase(Locale.ROOT);
         if (isSemiStructure(toLowerString)) {
@@ -78,7 +99,87 @@ public class StarrocksTypeMapper
         }
     }
 
-    public static Type mappingBasicType(String starrocksColumnType)
+    public String toStarrocksType(Type trinoType)
+    {
+        requireNonNull(trinoType, "trinoType is null");
+
+        if (trinoType instanceof BooleanType) {
+            return "boolean";
+        }
+        if (trinoType instanceof TinyintType) {
+            return "tinyint";
+        }
+        if (trinoType instanceof SmallintType) {
+            return "smallint";
+        }
+        if (trinoType instanceof IntegerType) {
+            return "int";
+        }
+        if (trinoType instanceof BigintType) {
+            return "bigint";
+        }
+        if (trinoType instanceof RealType) {
+            return "float";
+        }
+        if (trinoType instanceof DoubleType) {
+            return "double";
+        }
+        if (trinoType instanceof DecimalType decimalType) {
+            return "decimal(" + decimalType.getPrecision() + "," + decimalType.getScale() + ")";
+        }
+        if (trinoType instanceof CharType charType) {
+            return "char(" + charType.getLength() + ")";
+        }
+        if (trinoType instanceof VarcharType varcharType) {
+            if (varcharType.isUnbounded()) {
+                return "string";
+            }
+            int length = varcharType.getBoundedLength();
+            if (length <= STARROCKS_MAX_VARCHAR_LENGTH) {
+                return "varchar(" + length + ")";
+            }
+            return "string";
+        }
+        if (trinoType instanceof VarbinaryType) {
+            return "varbinary";
+        }
+        if (trinoType instanceof DateType) {
+            return "date";
+        }
+        if (trinoType instanceof TimestampType) {
+            return "datetime";
+        }
+        if (trinoType.getBaseName().equals(StandardTypes.JSON)) {
+            return "json";
+        }
+        if (trinoType instanceof ArrayType arrayType) {
+            return "array<" + toStarrocksType(arrayType.getElementType()) + ">";
+        }
+        if (trinoType instanceof MapType mapType) {
+            return "map<" + toStarrocksType(mapType.getKeyType()) + "," + toStarrocksType(mapType.getValueType()) + ">";
+        }
+        if (trinoType instanceof RowType rowType) {
+            return toStarrocksStructType(rowType);
+        }
+
+        throw new UnsupportedOperationException("Unsupported Trino type: " + trinoType.getDisplayName());
+    }
+
+    private String toStarrocksStructType(RowType rowType)
+    {
+        List<RowType.Field> fields = rowType.getFields();
+        List<String> fieldDefinitions = new ArrayList<>(fields.size());
+        for (int i = 0; i < fields.size(); i++) {
+            RowType.Field field = fields.get(i);
+            String fieldName = field.getName()
+                    .filter(name -> !name.isBlank())
+                    .orElse("field_" + i);
+            fieldDefinitions.add(fieldName + " " + toStarrocksType(field.getType()));
+        }
+        return "struct<" + String.join(", ", fieldDefinitions) + ">";
+    }
+
+    public Type mappingBasicType(String starrocksColumnType)
     {
         String type = starrocksColumnType.toLowerCase(Locale.ROOT);
         if (type.startsWith("decimal")) {
@@ -132,13 +233,13 @@ public class StarrocksTypeMapper
                 return DecimalType.createDecimalType();
             }
             case "json" -> {
-                return JsonType.JSON;
+                return jsonType;
             }
             default -> throw new UnsupportedOperationException("Unsupported StarRocks type: " + starrocksColumnType);
         }
     }
 
-    public static Type mappingSemiStructure(String columnType)
+    public Type mappingSemiStructure(String columnType)
     {
         if (columnType.startsWith("map")) {
             Type[] mapElementTypes = getMapElementType(columnType);
@@ -172,7 +273,7 @@ public class StarrocksTypeMapper
         return starrocksType.startsWith("map") || starrocksType.startsWith("array") || starrocksType.startsWith("struct");
     }
 
-    public static Type getArrayElementType(String statement)
+    public Type getArrayElementType(String statement)
     {
         int start = statement.indexOf('<');
         int end = statement.lastIndexOf('>');
@@ -183,7 +284,7 @@ public class StarrocksTypeMapper
         return mappingSemiStructure(type);
     }
 
-    public static List<RowType.Field> getRowElementType(String statement)
+    public List<RowType.Field> getRowElementType(String statement)
     {
         int start = statement.indexOf('<');
         int end = statement.lastIndexOf('>');
@@ -235,7 +336,7 @@ public class StarrocksTypeMapper
         }).toList();
     }
 
-    public static Type[] getMapElementType(String statement)
+    public Type[] getMapElementType(String statement)
     {
         int start = statement.indexOf('<');
         int end = statement.lastIndexOf('>');

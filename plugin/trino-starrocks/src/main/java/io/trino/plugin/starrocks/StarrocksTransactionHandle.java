@@ -13,10 +13,59 @@
  */
 package io.trino.plugin.starrocks;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 
-public enum StarrocksTransactionHandle
+import java.util.Objects;
+import java.util.UUID;
+
+import static java.util.Objects.requireNonNull;
+
+public class StarrocksTransactionHandle
         implements ConnectorTransactionHandle
 {
-    INSTANCE
+    private final UUID uuid;
+
+    public StarrocksTransactionHandle()
+    {
+        this(UUID.randomUUID());
+    }
+
+    @JsonCreator
+    public StarrocksTransactionHandle(@JsonProperty("uuid") UUID uuid)
+    {
+        this.uuid = requireNonNull(uuid, "uuid is null");
+    }
+
+    @JsonProperty
+    public UUID getUuid()
+    {
+        return uuid;
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        StarrocksTransactionHandle that = (StarrocksTransactionHandle) o;
+        return Objects.equals(uuid, that.uuid);
+    }
+
+    @Override
+    public int hashCode()
+    {
+        return Objects.hash(uuid);
+    }
+
+    @Override
+    public String toString()
+    {
+        return uuid.toString();
+    }
 }

@@ -17,6 +17,7 @@ import com.google.inject.Inject;
 import io.airlift.bootstrap.LifeCycleManager;
 import io.trino.spi.connector.Connector;
 import io.trino.spi.connector.ConnectorMetadata;
+import io.trino.spi.connector.ConnectorPageSinkProvider;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplitManager;
@@ -25,6 +26,8 @@ import io.trino.spi.session.PropertyMetadata;
 import io.trino.spi.transaction.IsolationLevel;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.trino.spi.transaction.IsolationLevel.READ_COMMITTED;
 import static io.trino.spi.transaction.IsolationLevel.checkConnectorSupports;
@@ -34,24 +37,30 @@ public class StarrocksConnctor
 {
     private final LifeCycleManager lifeCycleManager;
     private final StarrocksClient client;
-    private final StarrocksMetadata metadata;
+    private final StarrocksConfig config;
+    private final StarrocksTypeMapper typeMapper;
     private final StarrocksSplitManager splitManager;
     private final StarrocksPageSourceProvider pageSourceProvider;
+    private final StarrocksPageSinkProvider pageSinkProvider;
     private final List<PropertyMetadata<?>> sessionProperties;
     private final StarrocksTableProperties tableProperties;
+    private final Map<StarrocksTransactionHandle, StarrocksMetadata> transactionMetadata = new ConcurrentHashMap<>();
 
     @Inject
     public StarrocksConnctor(
             LifeCycleManager lifeCycleManager,
             StarrocksClient client,
             StarrocksConfig config,
-            StarrocksSessionProperties sessionProperties)
+            StarrocksSessionProperties sessionProperties,
+            StarrocksTypeMapper typeMapper)
     {
         this.lifeCycleManager = lifeCycleManager;
         this.client = client;
-        this.metadata = new StarrocksMetadata(client, config);
+        this.config = config;
+        this.typeMapper = typeMapper;
         this.splitManager = new StarrocksSplitManager(client);
-        this.pageSourceProvider = new StarrocksPageSourceProvider(client);
+        this.pageSourceProvider = new StarrocksPageSourceProvider(client, typeMapper);
+        this.pageSinkProvider = new StarrocksPageSinkProvider(config);
         this.sessionProperties = sessionProperties.getSessionProperties();
         this.tableProperties = new StarrocksTableProperties();
     }
@@ -60,13 +69,37 @@ public class StarrocksConnctor
     public ConnectorTransactionHandle beginTransaction(IsolationLevel isolationLevel, boolean readOnly, boolean autoCommit)
     {
         checkConnectorSupports(READ_COMMITTED, isolationLevel);
-        return StarrocksTransactionHandle.INSTANCE;
+        StarrocksTransactionHandle handle = new StarrocksTransactionHandle();
+        transactionMetadata.put(handle, new StarrocksMetadata(client, config, typeMapper));
+        return handle;
     }
 
     @Override
     public ConnectorMetadata getMetadata(ConnectorSession session, ConnectorTransactionHandle transactionHandle)
     {
+        StarrocksMetadata metadata = transactionMetadata.get((StarrocksTransactionHandle) transactionHandle);
+        if (metadata == null) {
+            throw new IllegalStateException("No metadata for transaction handle: " + transactionHandle);
+        }
         return metadata;
+    }
+
+    @Override
+    public void commit(ConnectorTransactionHandle transactionHandle)
+    {
+        StarrocksMetadata metadata = transactionMetadata.remove((StarrocksTransactionHandle) transactionHandle);
+        if (metadata != null) {
+            metadata.clearRollback();
+        }
+    }
+
+    @Override
+    public void rollback(ConnectorTransactionHandle transactionHandle)
+    {
+        StarrocksMetadata metadata = transactionMetadata.remove((StarrocksTransactionHandle) transactionHandle);
+        if (metadata != null) {
+            metadata.rollback();
+        }
     }
 
     @Override
@@ -85,6 +118,12 @@ public class StarrocksConnctor
     public ConnectorPageSourceProvider getPageSourceProvider()
     {
         return pageSourceProvider;
+    }
+
+    @Override
+    public ConnectorPageSinkProvider getPageSinkProvider()
+    {
+        return pageSinkProvider;
     }
 
     @Override

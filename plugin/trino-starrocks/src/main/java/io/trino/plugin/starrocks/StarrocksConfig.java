@@ -26,7 +26,7 @@ public class StarrocksConfig
     private String scanURL;
     private String jdbcURL;
     private String username;
-    private Optional<String> password;
+    private Optional<String> password = Optional.empty();
     private Duration scanConnectTimeout = Duration.valueOf("1s");
     private int scanBatchRows = 1000;
     private String scanProperties;

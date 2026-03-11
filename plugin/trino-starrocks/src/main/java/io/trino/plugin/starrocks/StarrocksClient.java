@@ -24,11 +24,19 @@ public class StarrocksClient
     private final StarrocksBEClient beClient;
 
     @Inject
-    public StarrocksClient(StarrocksConfig config)
+    public StarrocksClient(StarrocksConfig config, StarrocksCatalogName catalogName)
+    {
+        this(
+                config,
+                new StarrocksFEClient(config, catalogName),
+                new StarrocksBEClient(config));
+    }
+
+    StarrocksClient(StarrocksConfig config, StarrocksFEClient feClient, StarrocksBEClient beClient)
     {
         this.config = requireNonNull(config, "config is null");
-        this.feClient = new StarrocksFEClient(config);
-        this.beClient = new StarrocksBEClient(config);
+        this.feClient = requireNonNull(feClient, "feClient is null");
+        this.beClient = requireNonNull(beClient, "beClient is null");
     }
 
     public StarrocksFEClient getFeClient()
