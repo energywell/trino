@@ -18,6 +18,8 @@ import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorViewDefinition;
 import io.trino.spi.connector.MaterializedViewFreshness;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.SortItem;
+import io.trino.spi.connector.SortOrder;
 import io.trino.spi.predicate.TupleDomain;
 import org.junit.Test;
 
@@ -27,11 +29,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.testing.TestingConnectorSession.SESSION;
 import static io.trino.type.InternalTypeManager.TESTING_TYPE_MANAGER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 public class StarrocksMetadataViewTest
 {
@@ -54,6 +58,8 @@ public class StarrocksMetadataViewTest
                 TupleDomain.all(),
                 Optional.empty(),
                 Optional.empty(),
+                Optional.empty(),
+                OptionalLong.empty(),
                 Optional.empty());
         feClient.tables.put(tableName, tableHandle);
 
@@ -76,6 +82,7 @@ public class StarrocksMetadataViewTest
                 Optional.of("starrocks"),
                 Optional.of("test"),
                 List.of(new ConnectorMaterializedViewDefinition.Column("orderkey", BIGINT.getTypeId(), Optional.empty())),
+                Optional.empty(),
                 Optional.empty(),
                 Optional.empty(),
                 Optional.of("starrocks"),
@@ -126,6 +133,7 @@ public class StarrocksMetadataViewTest
                 List.of(new ConnectorMaterializedViewDefinition.Column("c", BIGINT.getTypeId(), Optional.empty())),
                 Optional.empty(),
                 Optional.empty(),
+                Optional.empty(),
                 Optional.of("starrocks"),
                 List.of()));
 
@@ -136,6 +144,75 @@ public class StarrocksMetadataViewTest
         SchemaTableName targetMaterializedView = new SchemaTableName("test", "target_mv");
         metadata.renameMaterializedView(SESSION, sourceMaterializedView, targetMaterializedView);
         assertThat(feClient.materializedViews).containsKey(targetMaterializedView).doesNotContainKey(sourceMaterializedView);
+    }
+
+    @Test
+    public void testGetTableMetadataHandlesNullCommentAndExtra()
+    {
+        StarrocksMetadata metadata = newMetadata(new FakeStarrocksFEClient());
+        StarrocksTableHandle tableHandle = new StarrocksTableHandle(
+                new SchemaTableName("test", "orders"),
+                List.of(new StarrocksColumnHandle("orderkey", 1, "bigint", "bigint", false, null, null, 0, 0)),
+                TupleDomain.all(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                OptionalLong.empty(),
+                Optional.empty());
+
+        assertThatCode(() -> metadata.getTableMetadata(SESSION, tableHandle))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testApplyLimitPushdown()
+    {
+        StarrocksMetadata metadata = newMetadata(new FakeStarrocksFEClient());
+        StarrocksTableHandle tableHandle = new StarrocksTableHandle(
+                new SchemaTableName("test", "orders"),
+                List.of(new StarrocksColumnHandle("orderkey", 1, "bigint", "bigint", false, "", "", 0, 0)),
+                TupleDomain.all(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                OptionalLong.empty(),
+                Optional.empty());
+
+        StarrocksTableHandle pushedHandle = (StarrocksTableHandle) metadata.applyLimit(SESSION, tableHandle, 100)
+                .orElseThrow()
+                .getHandle();
+
+        assertThat(pushedHandle.getLimit()).hasValue(100);
+    }
+
+    @Test
+    public void testApplyTopNPushdown()
+    {
+        StarrocksMetadata metadata = newMetadata(new FakeStarrocksFEClient());
+        StarrocksColumnHandle column = new StarrocksColumnHandle("orderkey", 1, "bigint", "bigint", false, "", "", 0, 0);
+        StarrocksTableHandle tableHandle = new StarrocksTableHandle(
+                new SchemaTableName("test", "orders"),
+                List.of(column),
+                TupleDomain.all(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                OptionalLong.empty(),
+                Optional.empty());
+
+        StarrocksTableHandle pushedHandle = (StarrocksTableHandle) metadata.applyTopN(
+                SESSION,
+                tableHandle,
+                10,
+                List.of(new SortItem("c1", SortOrder.DESC_NULLS_LAST)),
+                Map.of("c1", column))
+                .orElseThrow()
+                .getHandle();
+
+        assertThat(pushedHandle.getLimit()).hasValue(10);
+        assertThat(pushedHandle.getSortOrder()).isPresent();
+        assertThat(pushedHandle.getSortOrder().orElseThrow())
+                .containsExactly(new SortItem("orderkey", SortOrder.DESC_NULLS_LAST));
     }
 
     private static StarrocksMetadata newMetadata(FakeStarrocksFEClient feClient)

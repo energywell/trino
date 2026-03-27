@@ -25,10 +25,16 @@ import com.starrocks.thrift.TScanOpenParams;
 import com.starrocks.thrift.TScanOpenResult;
 import com.starrocks.thrift.TStarrocksExternalService;
 import com.starrocks.thrift.TStatusCode;
+import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.SchemaTableName;
 
 import java.util.List;
+
+import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
+import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class StarrocksBeReader
         implements AutoCloseable
@@ -36,8 +42,9 @@ public class StarrocksBeReader
     private final String ip;
     private final int port;
     private final StarrocksConfig config;
-    private SchemaTableName schemaTableName;
-    private List<ColumnHandle> columnHandle;
+    private final SchemaTableName schemaTableName;
+    private final List<ColumnHandle> columnHandle;
+    private final TSocket socket;
     private String contextId;
     private int readerOffset;
     private TStarrocksExternalService.Client client;
@@ -48,28 +55,28 @@ public class StarrocksBeReader
             List<ColumnHandle> columns,
             SchemaTableName schemaTableName)
     {
-        // 实现逻辑
+        this.config = requireNonNull(config, "config is null");
+        this.schemaTableName = requireNonNull(schemaTableName, "schemaTableName is null");
+        this.columnHandle = requireNonNull(columns, "columns is null");
+
         String[] beNode = beInfo.split(":");
         String ip = beNode[0].trim();
         int port = Integer.parseInt(beNode[1].trim());
 
         TBinaryProtocol.Factory factory = new TBinaryProtocol.Factory();
-        // TODO:add timeout config
-        TSocket socket = new TSocket(ip, port);
+        int socketTimeoutMillis = (int) Math.max(1, Math.min(Integer.MAX_VALUE, this.config.getScanConnectTimeout().toMillis()));
+        this.socket = new TSocket(ip, port, socketTimeoutMillis);
         try {
-            socket.open();
+            this.socket.open();
         }
         catch (TTransportException e) {
-            socket.close();
-            throw new RuntimeException("Failed to open socket to " + ip + ":" + port, e);
+            this.socket.close();
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to open scanner socket to " + ip + ":" + port, e);
         }
-        TProtocol protocol = factory.getProtocol(socket);
+        TProtocol protocol = factory.getProtocol(this.socket);
         this.ip = ip;
         this.port = port;
         this.client = new TStarrocksExternalService.Client(protocol);
-        this.config = config;
-        this.schemaTableName = schemaTableName;
-        this.columnHandle = columns;
     }
 
     public TStarrocksExternalService.Client getClient()
@@ -89,24 +96,24 @@ public class StarrocksBeReader
         params.setTable(schemaTableName.getTableName());
         params.setUser(config.getUsername());
         params.setPasswd(config.getPassword().orElse(null));
-        // TODO:this param should be configurable
-        params.setBatch_size(4096);
-        short keepAliveMin = (short) Math.min(Short.MAX_VALUE, 10);
+        params.setBatch_size(config.getScanBatchRows());
+        short keepAliveMin = (short) Math.min(Short.MAX_VALUE, config.getScanKeepAlive().roundTo(MINUTES));
         params.setKeep_alive_min(keepAliveMin);
-        params.setQuery_timeout(600);
+        params.setQuery_timeout((int) Math.min(Integer.MAX_VALUE, config.getScanQueryTimeout().roundTo(SECONDS)));
         params.setMem_limit(1024 * 1024 * 1024L);
         TScanOpenResult result = null;
         try {
             result = client.open_scanner(params);
             if (!result.getStatus().getStatus_code().equals(TStatusCode.OK)) {
-                throw new RuntimeException(
+                throw new TrinoException(
+                        GENERIC_INTERNAL_ERROR,
                         "Failed to open scanner."
                                 + result.getStatus().getStatus_code()
                                 + result.getStatus().getError_msgs());
             }
         }
         catch (TException e) {
-            throw new RuntimeException("Failed to open scanner." + e.getMessage());
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to open scanner.", e);
         }
         this.contextId = result.getContext_id();
     }
@@ -120,13 +127,14 @@ public class StarrocksBeReader
         try {
             result = client.get_next(params);
             if (!TStatusCode.OK.equals(result.getStatus().getStatus_code())) {
-                throw new RuntimeException(
+                throw new TrinoException(
+                        GENERIC_INTERNAL_ERROR,
                         "Failed to get next from be -> ip:[" + ip + "] "
                                 + result.getStatus().getStatus_code() + " msg:" + result.getStatus().getError_msgs());
             }
         }
         catch (TException e) {
-            throw new RuntimeException(e.getMessage());
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to fetch scanner batch from " + ip + ":" + port, e);
         }
         return result;
     }
@@ -144,13 +152,19 @@ public class StarrocksBeReader
     @Override
     public void close()
     {
-        TScanCloseParams tScanCloseParams = new TScanCloseParams();
-        tScanCloseParams.setContext_id(this.contextId);
-        try {
-            this.client.close_scanner(tScanCloseParams);
+        if (this.contextId != null) {
+            TScanCloseParams tScanCloseParams = new TScanCloseParams();
+            tScanCloseParams.setContext_id(this.contextId);
+            try {
+                this.client.close_scanner(tScanCloseParams);
+            }
+            catch (TException e) {
+                throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to close scanner context " + contextId, e);
+            }
+            finally {
+                this.contextId = null;
+            }
         }
-        catch (TException e) {
-            throw new RuntimeException(e.getMessage());
-        }
+        this.socket.close();
     }
 }

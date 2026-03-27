@@ -39,9 +39,9 @@ public class StarrocksConnctor
     private final StarrocksClient client;
     private final StarrocksConfig config;
     private final StarrocksTypeMapper typeMapper;
-    private final StarrocksSplitManager splitManager;
-    private final StarrocksPageSourceProvider pageSourceProvider;
-    private final StarrocksPageSinkProvider pageSinkProvider;
+    private final ConnectorSplitManager splitManager;
+    private final ConnectorPageSourceProvider pageSourceProvider;
+    private final ConnectorPageSinkProvider pageSinkProvider;
     private final List<PropertyMetadata<?>> sessionProperties;
     private final StarrocksTableProperties tableProperties;
     private final Map<StarrocksTransactionHandle, StarrocksMetadata> transactionMetadata = new ConcurrentHashMap<>();
@@ -52,17 +52,21 @@ public class StarrocksConnctor
             StarrocksClient client,
             StarrocksConfig config,
             StarrocksSessionProperties sessionProperties,
-            StarrocksTypeMapper typeMapper)
+            StarrocksTypeMapper typeMapper,
+            ConnectorSplitManager splitManager,
+            ConnectorPageSourceProvider pageSourceProvider,
+            ConnectorPageSinkProvider pageSinkProvider,
+            StarrocksTableProperties tableProperties)
     {
         this.lifeCycleManager = lifeCycleManager;
         this.client = client;
         this.config = config;
         this.typeMapper = typeMapper;
-        this.splitManager = new StarrocksSplitManager(client);
-        this.pageSourceProvider = new StarrocksPageSourceProvider(client, typeMapper);
-        this.pageSinkProvider = new StarrocksPageSinkProvider(config);
+        this.splitManager = splitManager;
+        this.pageSourceProvider = pageSourceProvider;
+        this.pageSinkProvider = pageSinkProvider;
         this.sessionProperties = sessionProperties.getSessionProperties();
-        this.tableProperties = new StarrocksTableProperties();
+        this.tableProperties = tableProperties;
     }
 
     @Override

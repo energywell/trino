@@ -15,10 +15,12 @@ package io.trino.plugin.starrocks;
 
 import com.starrocks.thrift.TScanBatchResult;
 import io.trino.spi.Page;
+import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
+import io.trino.spi.connector.SourcePage;
 import io.trino.spi.type.Type;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
@@ -31,6 +33,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static java.util.Objects.requireNonNull;
 
 public class StarrocksPageSource
@@ -79,7 +82,7 @@ public class StarrocksPageSource
     }
 
     @Override
-    public Page getNextPage()
+    public SourcePage getNextSourcePage()
     {
         if (finished) {
             return null;
@@ -122,10 +125,10 @@ public class StarrocksPageSource
             beReader.setReaderOffset(beReader.getReaderOffset() + root.getRowCount());
             Block[] blocks = Arrays.stream(blockBuilders).map(BlockBuilder::build).toArray(Block[]::new);
             fieldVectors.forEach(FieldVector::clear);
-            return new Page(root.getRowCount(), blocks);
+            return SourcePage.create(new Page(root.getRowCount(), blocks));
         }
         catch (IOException e) {
-            throw new RuntimeException("Failed to read next Arrow batch", e);
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to read next Arrow batch", e);
         }
     }
 
@@ -160,7 +163,7 @@ public class StarrocksPageSource
             }
         }
         catch (IOException e) {
-            throw new RuntimeException("Failed to close StarrocksPageSource", e);
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to close StarrocksPageSource", e);
         }
     }
 

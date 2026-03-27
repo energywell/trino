@@ -34,6 +34,7 @@ import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.ConnectorViewDefinition;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
+import io.trino.spi.connector.LimitApplicationResult;
 import io.trino.spi.connector.MaterializedViewFreshness;
 import io.trino.spi.connector.MaterializedViewNotFoundException;
 import io.trino.spi.connector.ProjectionApplicationResult;
@@ -41,6 +42,8 @@ import io.trino.spi.connector.RetryMode;
 import io.trino.spi.connector.SaveMode;
 import io.trino.spi.connector.SchemaNotFoundException;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.SortItem;
+import io.trino.spi.connector.TopNApplicationResult;
 import io.trino.spi.connector.ViewNotFoundException;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
@@ -310,8 +313,8 @@ public class StarrocksMetadata
                                     column.getColumnSize(),
                                     column.getDecimalDigits()));
                             builder.setNullable(column.isNullable());
-                            builder.setComment(Optional.of(column.getComment()));
-                            builder.setExtraInfo(Optional.of(column.getExtra()));
+                            builder.setComment(Optional.ofNullable(column.getComment()));
+                            builder.setExtraInfo(Optional.ofNullable(column.getExtra()));
                             return builder.build();
                         })
                         .collect(toImmutableList()),
@@ -372,7 +375,9 @@ public class StarrocksMetadata
                 starrocksHandle.getConstraint(),
                 starrocksHandle.getComment(),
                 starrocksHandle.getPartitionKey(),
-                starrocksHandle.getProperties());
+                starrocksHandle.getProperties(),
+                starrocksHandle.getLimit(),
+                starrocksHandle.getSortOrder());
 
         List<Assignment> assignmentList = projectedColumns.entrySet().stream()
                 .map(entry ->
@@ -441,9 +446,90 @@ public class StarrocksMetadata
                 newDomain,
                 handle.getComment(),
                 handle.getPartitionKey(),
-                handle.getProperties());
+                handle.getProperties(),
+                handle.getLimit(),
+                handle.getSortOrder());
 
-        return Optional.of(new ConstraintApplicationResult<>(newHandle, constraint.getSummary(), constraint.getExpression(), false));
+        return Optional.of(new ConstraintApplicationResult<>(newHandle, TupleDomain.all(), constraint.getExpression(), false));
+    }
+
+    @Override
+    public Optional<LimitApplicationResult<ConnectorTableHandle>> applyLimit(ConnectorSession session, ConnectorTableHandle table, long limit)
+    {
+        StarrocksTableHandle handle = (StarrocksTableHandle) table;
+
+        if (handle.getLimit().isPresent() && handle.getLimit().getAsLong() <= limit) {
+            return Optional.empty();
+        }
+
+        StarrocksTableHandle updatedHandle = new StarrocksTableHandle(
+                handle.getSchemaTableName(),
+                handle.getColumns(),
+                handle.getConstraint(),
+                handle.getComment(),
+                handle.getPartitionKey(),
+                handle.getProperties(),
+                OptionalLong.of(limit),
+                handle.getSortOrder());
+
+        return Optional.of(new LimitApplicationResult<>(updatedHandle, true, false));
+    }
+
+    @Override
+    public Optional<TopNApplicationResult<ConnectorTableHandle>> applyTopN(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            long topNCount,
+            List<SortItem> sortItems,
+            Map<String, ColumnHandle> assignments)
+    {
+        if (topNCount <= 0 || sortItems.isEmpty()) {
+            return Optional.empty();
+        }
+
+        StarrocksTableHandle handle = (StarrocksTableHandle) table;
+
+        List<SortItem> normalizedSortItems = sortItems.stream()
+                .map(sortItem -> {
+                    ColumnHandle assignment = assignments.get(sortItem.getName());
+                    if (!(assignment instanceof StarrocksColumnHandle)) {
+                        return null;
+                    }
+                    StarrocksColumnHandle columnHandle = (StarrocksColumnHandle) assignment;
+                    return new SortItem(columnHandle.getColumnName(), sortItem.getSortOrder());
+                })
+                .collect(toImmutableList());
+
+        if (normalizedSortItems.stream().anyMatch(item -> item == null)) {
+            return Optional.empty();
+        }
+
+        if (handle.getSortOrder().isPresent() && !handle.getSortOrder().get().equals(normalizedSortItems)) {
+            return Optional.empty();
+        }
+
+        long pushedLimit = handle.getLimit().isPresent()
+                ? Math.min(handle.getLimit().getAsLong(), topNCount)
+                : topNCount;
+
+        if (handle.getSortOrder().isPresent() &&
+                handle.getSortOrder().get().equals(normalizedSortItems) &&
+                handle.getLimit().isPresent() &&
+                handle.getLimit().getAsLong() <= pushedLimit) {
+            return Optional.empty();
+        }
+
+        StarrocksTableHandle updatedHandle = new StarrocksTableHandle(
+                handle.getSchemaTableName(),
+                handle.getColumns(),
+                handle.getConstraint(),
+                handle.getComment(),
+                handle.getPartitionKey(),
+                handle.getProperties(),
+                OptionalLong.of(pushedLimit),
+                Optional.of(normalizedSortItems));
+
+        return Optional.of(new TopNApplicationResult<>(updatedHandle, true, false));
     }
 
     @Override
@@ -605,7 +691,7 @@ public class StarrocksMetadata
     {
         Type type = constant.getType();
         Object nativeValue = constant.getValue();
-        Object value = type.getObjectValue(null, nativeValueToBlock(type, nativeValue), 0);
+        Object value = type.getObjectValue(nativeValueToBlock(type, nativeValue), 0);
         if (value == null) {
             return "NULL";
         }

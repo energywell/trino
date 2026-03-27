@@ -76,7 +76,6 @@ public class StarrocksSplit
         return opaquedQueryPlan;
     }
 
-    @Override
     public Map<String, String> getSplitInfo()
     {
         return Map.of(

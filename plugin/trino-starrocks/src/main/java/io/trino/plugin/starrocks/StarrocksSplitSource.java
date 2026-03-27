@@ -16,6 +16,7 @@ package io.trino.plugin.starrocks;
 
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableList;
+import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplitSource;
 
@@ -23,6 +24,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
 import static io.trino.plugin.starrocks.StarrocksSessionProperties.getDynamicFilteringWaitTimeout;
+import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static java.util.Objects.requireNonNull;
 
 public class StarrocksSplitSource
@@ -81,7 +83,7 @@ public class StarrocksSplitSource
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            throw new RuntimeException(e);
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to resolve StarRocks split source", e);
         }
     }
 }

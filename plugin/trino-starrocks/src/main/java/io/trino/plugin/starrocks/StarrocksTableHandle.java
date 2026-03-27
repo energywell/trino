@@ -18,12 +18,14 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.SortItem;
 import io.trino.spi.predicate.TupleDomain;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.stream.Collectors;
 
 import static java.util.Objects.requireNonNull;
@@ -37,6 +39,8 @@ public class StarrocksTableHandle
     private final Optional<String> comment;
     private final Optional<List<String>> partitionKey;
     private final Optional<Map<String, Object>> properties;
+    private final OptionalLong limit;
+    private final Optional<List<SortItem>> sortOrder;
 
     @JsonCreator
     public StarrocksTableHandle(
@@ -45,7 +49,9 @@ public class StarrocksTableHandle
             @JsonProperty("constraint") TupleDomain<ColumnHandle> constraint,
             @JsonProperty("comment") Optional<String> comment,
             @JsonProperty("partitionKey") Optional<List<String>> partitionKey,
-            @JsonProperty("properties") Optional<Map<String, Object>> properties)
+            @JsonProperty("properties") Optional<Map<String, Object>> properties,
+            @JsonProperty("limit") OptionalLong limit,
+            @JsonProperty("sortOrder") Optional<List<SortItem>> sortOrder)
 
     {
         this.schemaTableName = requireNonNull(schemaTableName, "schemaTableName is null");
@@ -54,6 +60,8 @@ public class StarrocksTableHandle
         this.comment = comment;
         this.partitionKey = partitionKey;
         this.properties = properties;
+        this.limit = requireNonNull(limit, "limit is null");
+        this.sortOrder = requireNonNull(sortOrder, "sortOrder is null");
     }
 
     @JsonProperty
@@ -92,10 +100,22 @@ public class StarrocksTableHandle
         return properties;
     }
 
+    @JsonProperty
+    public OptionalLong getLimit()
+    {
+        return limit;
+    }
+
+    @JsonProperty
+    public Optional<List<SortItem>> getSortOrder()
+    {
+        return sortOrder;
+    }
+
     @Override
     public int hashCode()
     {
-        return Objects.hash(schemaTableName, columns);
+        return Objects.hash(schemaTableName, columns, comment, constraint, limit, sortOrder);
     }
 
     @Override
@@ -111,7 +131,9 @@ public class StarrocksTableHandle
         return Objects.equals(this.schemaTableName, other.schemaTableName) &&
                 Objects.equals(this.columns, other.columns) &&
                 Objects.equals(this.comment, other.comment) &&
-                Objects.equals(this.constraint, other.constraint);
+            Objects.equals(this.constraint, other.constraint) &&
+            Objects.equals(this.limit, other.limit) &&
+            Objects.equals(this.sortOrder, other.sortOrder);
     }
 
     @Override
@@ -134,6 +156,10 @@ public class StarrocksTableHandle
         if (!columns.isEmpty()) {
             builder.append(" columns=").append(columns);
         }
+        if (limit.isPresent()) {
+            builder.append(" limit=").append(limit.getAsLong());
+        }
+        sortOrder.ifPresent(order -> builder.append(" sortOrder=").append(order));
         return builder.toString();
     }
 }

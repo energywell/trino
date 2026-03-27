@@ -13,7 +13,16 @@
  */
 package io.trino.plugin.starrocks;
 
-class StarrocksFEClientTest
+import org.junit.Test;
+
+import java.time.Instant;
+import java.util.List;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+public class StarrocksFEClientTest
 {
     private static final String JDBC_URL = "jdbc:mysql://localhost:9030";
     private static final String Scanner_URL = "localhost:8030";
@@ -80,4 +89,48 @@ class StarrocksFEClientTest
 //                TestingConnectorSession.SESSION,
 //                new SchemaTableName("quickstart", "crashdata"));
 //    }
+
+    @Test
+    public void testParseIsNullable()
+    {
+        assertTrue(StarrocksFEClient.parseIsNullable("YES"));
+        assertTrue(StarrocksFEClient.parseIsNullable("yes"));
+        assertFalse(StarrocksFEClient.parseIsNullable("NO"));
+        assertFalse(StarrocksFEClient.parseIsNullable("no"));
+    }
+
+    @Test
+    public void testParseIsNullableFallback()
+    {
+        assertTrue(StarrocksFEClient.parseIsNullable(null));
+        assertTrue(StarrocksFEClient.parseIsNullable("UNKNOWN"));
+    }
+
+    @Test
+    public void testParsePartitionKeys()
+    {
+        assertEquals(List.of(), StarrocksFEClient.parsePartitionKeys(null));
+        assertEquals(List.of(), StarrocksFEClient.parsePartitionKeys(""));
+        assertEquals(List.of(), StarrocksFEClient.parsePartitionKeys("   "));
+        assertEquals(List.of("ds", "region"), StarrocksFEClient.parsePartitionKeys("`ds`, `region`"));
+        assertEquals(List.of("a", "b"), StarrocksFEClient.parsePartitionKeys("a, , b"));
+    }
+
+    @Test
+    public void testNormalizeEndpoint()
+    {
+        assertEquals("http://host:8030", StarrocksFEClient.normalizeEndpoint("host:8030"));
+        assertEquals("https://host:8030", StarrocksFEClient.normalizeEndpoint("https://host:8030"));
+        assertEquals("http://host:8030", StarrocksFEClient.normalizeEndpoint("http://host:8030"));
+    }
+
+    @Test
+    public void testParseRefreshInstant()
+    {
+        assertTrue(StarrocksFEClient.parseRefreshInstant(null).isEmpty());
+        assertEquals(Instant.ofEpochSecond(1_700_000_000L), StarrocksFEClient.parseRefreshInstant(1_700_000_000L).orElseThrow());
+        assertEquals(Instant.ofEpochMilli(1_700_000_000_000L), StarrocksFEClient.parseRefreshInstant(1_700_000_000_000L).orElseThrow());
+        assertEquals(Instant.parse("2026-03-16T10:00:00Z"), StarrocksFEClient.parseRefreshInstant("2026-03-16T10:00:00Z").orElseThrow());
+        assertEquals(Instant.parse("2026-03-16T10:00:00Z"), StarrocksFEClient.parseRefreshInstant("2026-03-16 10:00:00").orElseThrow());
+    }
 }
