@@ -72,11 +72,13 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
@@ -498,9 +500,9 @@ public class StarrocksMetadata
                     StarrocksColumnHandle columnHandle = (StarrocksColumnHandle) assignment;
                     return new SortItem(columnHandle.getColumnName(), sortItem.getSortOrder());
                 })
-                .collect(toImmutableList());
+                .collect(Collectors.toList());
 
-        if (normalizedSortItems.stream().anyMatch(item -> item == null)) {
+        if (normalizedSortItems.stream().anyMatch(Objects::isNull)) {
             return Optional.empty();
         }
 

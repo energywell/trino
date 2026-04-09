@@ -52,7 +52,6 @@ public class StarrocksTableHandle
             @JsonProperty("properties") Optional<Map<String, Object>> properties,
             @JsonProperty("limit") OptionalLong limit,
             @JsonProperty("sortOrder") Optional<List<SortItem>> sortOrder)
-
     {
         this.schemaTableName = requireNonNull(schemaTableName, "schemaTableName is null");
         this.columns = requireNonNull(columns, "columns is null");
