@@ -74,6 +74,7 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Timestamp;
+import java.sql.Types;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
@@ -1190,28 +1191,197 @@ public class StarrocksFEClient
             return OptionalLong.of(0);
         }
 
-        String assignments = handle.getAssignments().entrySet().stream()
-                .map(entry -> "`" + entry.getKey() + "` = " + entry.getValue())
-                .collect(Collectors.joining(", "));
-        if (assignments.isBlank()) {
+        List<StarrocksAssignment> assignments = handle.getAssignments();
+        if (assignments.isEmpty()) {
             return OptionalLong.of(0);
         }
 
-        String sql = "UPDATE `" + tableHandle.getSchemaTableName().getSchemaName() + "`.`" + tableHandle.getSchemaTableName().getTableName() + "` SET " + assignments;
+        String setClause = assignments.stream()
+                .map(a -> quotedIdentifier(a.getColumnName()) + " = ?")
+                .collect(Collectors.joining(", "));
+        String sql = "UPDATE " + quotedTable(tableHandle.getSchemaTableName()) + " SET " + setClause;
+
+        List<BoundValue> whereParams = new ArrayList<>();
         if (!tableHandle.getConstraint().isAll()) {
-            String whereClause = buildPredicate(tableHandle.getConstraint(), domainLimit);
-            if (whereClause != null && !whereClause.isBlank()) {
-                sql = sql + " WHERE " + whereClause;
+            ParameterizedPredicate predicate = buildParameterizedPredicate(tableHandle.getConstraint(), domainLimit);
+            if (predicate != null && !predicate.sql().isBlank()) {
+                sql = sql + " WHERE " + predicate.sql();
+                whereParams = predicate.params();
             }
         }
 
         try (Connection connection = dbClient.openConnection(session);
-                Statement statement = connection.createStatement()) {
-            return OptionalLong.of(statement.executeUpdate(sql));
+                PreparedStatement statement = connection.prepareStatement(sql)) {
+            int paramIndex = 1;
+            for (StarrocksAssignment assignment : assignments) {
+                bindStringValue(statement, paramIndex++, assignment.getTrinoTypeName(), assignment.getSerializedValue());
+            }
+            for (BoundValue param : whereParams) {
+                bindStringValue(statement, paramIndex++, param.trinoTypeName(), param.serializedValue());
+            }
+            return OptionalLong.of(statement.executeUpdate());
         }
         catch (SQLException e) {
             LOG.error("Execute update SQL failed: {}", sql, e);
             throw new TrinoException(GENERIC_INTERNAL_ERROR, "UPDATE execution failed: " + e.getMessage(), e);
+        }
+    }
+
+    private ParameterizedPredicate buildParameterizedPredicate(TupleDomain<ColumnHandle> constraint, int domainLimit)
+    {
+        if (constraint.isNone() || constraint.isAll()) {
+            return null;
+        }
+
+        List<String> conjuncts = new ArrayList<>();
+        List<BoundValue> params = new ArrayList<>();
+
+        for (Map.Entry<ColumnHandle, Domain> entry : constraint.getDomains().get().entrySet()) {
+            StarrocksColumnHandle columnHandle = (StarrocksColumnHandle) entry.getKey();
+            Domain domain = entry.getValue().simplify(domainLimit);
+            String columnName = columnHandle.getColumnName();
+
+            if (domain.isOnlyNull()) {
+                conjuncts.add(String.format("`%s` IS NULL", columnName));
+            }
+            else if (domain.isNullAllowed()) {
+                Optional<ParameterizedPredicate> predicate = toParameterizedPredicate(columnName, domain.getValues(), domain);
+                if (predicate.isPresent()) {
+                    conjuncts.add(String.format("(`%s` IS NULL OR %s)", columnName, predicate.get().sql()));
+                    params.addAll(predicate.get().params());
+                }
+                else {
+                    conjuncts.add(String.format("`%s` IS NULL", columnName));
+                }
+            }
+            else {
+                Optional<ParameterizedPredicate> predicate = toParameterizedPredicate(columnName, domain.getValues(), domain);
+                if (predicate.isPresent()) {
+                    conjuncts.add(predicate.get().sql());
+                    params.addAll(predicate.get().params());
+                }
+            }
+        }
+
+        return new ParameterizedPredicate(String.join(" AND ", conjuncts), params);
+    }
+
+    private Optional<ParameterizedPredicate> toParameterizedPredicate(String columnName, ValueSet valueSet, Domain domain)
+    {
+        Type type = valueSet.getType();
+
+        if (valueSet instanceof EquatableValueSet equatable) {
+            List<BoundValue> params = new ArrayList<>();
+            List<String> placeholders = new ArrayList<>();
+            for (Object value : equatable.getValues()) {
+                Object objectValue = type.getObjectValue(nativeValueToBlock(type, value), 0);
+                params.add(new BoundValue(type.getDisplayName(), objectValueToString(objectValue, type)));
+                placeholders.add("?");
+            }
+            if (params.size() == 1) {
+                return Optional.of(new ParameterizedPredicate(
+                        String.format("`%s` = ?", columnName), params));
+            }
+            return Optional.of(new ParameterizedPredicate(
+                    String.format("`%s` IN (%s)", columnName, String.join(", ", placeholders)), params));
+        }
+        else if (valueSet instanceof SortedRangeSet sortedRangeSet) {
+            List<Range> ranges = sortedRangeSet.getOrderedRanges();
+            List<String> rangeConjuncts = new ArrayList<>();
+            List<BoundValue> params = new ArrayList<>();
+
+            if (valueSet.isAll() && !domain.isNullAllowed()) {
+                rangeConjuncts.add(String.format("`%s` IS NOT NULL", columnName));
+            }
+            if (ranges.stream().allMatch(Range::isSingleValue) && ranges.size() > 1) {
+                List<String> placeholders = new ArrayList<>();
+                for (Range range : ranges) {
+                    Object objectValue = type.getObjectValue(nativeValueToBlock(type, range.getSingleValue()), 0);
+                    params.add(new BoundValue(type.getDisplayName(), objectValueToString(objectValue, type)));
+                    placeholders.add("?");
+                }
+                rangeConjuncts.add(String.format("`%s` IN (%s)", columnName, String.join(", ", placeholders)));
+            }
+            else {
+                for (Range range : ranges) {
+                    if (range.isSingleValue()) {
+                        Object objectValue = type.getObjectValue(nativeValueToBlock(type, range.getSingleValue()), 0);
+                        params.add(new BoundValue(type.getDisplayName(), objectValueToString(objectValue, type)));
+                        rangeConjuncts.add(String.format("`%s` = ?", columnName));
+                    }
+                    else {
+                        if (!range.isLowUnbounded()) {
+                            String operator = range.isLowInclusive() ? ">=" : ">";
+                            Object objectValue = type.getObjectValue(nativeValueToBlock(type, range.getLowBoundedValue()), 0);
+                            params.add(new BoundValue(type.getDisplayName(), objectValueToString(objectValue, type)));
+                            rangeConjuncts.add(String.format("`%s` %s ?", columnName, operator));
+                        }
+                        if (!range.isHighUnbounded()) {
+                            String operator = range.isHighInclusive() ? "<=" : "<";
+                            Object objectValue = type.getObjectValue(nativeValueToBlock(type, range.getHighBoundedValue()), 0);
+                            params.add(new BoundValue(type.getDisplayName(), objectValueToString(objectValue, type)));
+                            rangeConjuncts.add(String.format("`%s` %s ?", columnName, operator));
+                        }
+                    }
+                }
+            }
+
+            if (rangeConjuncts.isEmpty()) {
+                return Optional.empty();
+            }
+            if (rangeConjuncts.size() == 1) {
+                return Optional.of(new ParameterizedPredicate(rangeConjuncts.get(0), params));
+            }
+            return Optional.of(new ParameterizedPredicate("(" + String.join(" OR ", rangeConjuncts) + ")", params));
+        }
+
+        throw new IllegalArgumentException("Unsupported ValueSet type: " + valueSet.getClass().getSimpleName());
+    }
+
+    private static String objectValueToString(Object value, Type type)
+    {
+        if (value == null) {
+            return null;
+        }
+        if (type instanceof DecimalType) {
+            return new BigDecimal(value.toString()).toPlainString();
+        }
+        return value.toString();
+    }
+
+    private static void bindStringValue(PreparedStatement statement, int index, String trinoTypeName, String serializedValue)
+            throws SQLException
+    {
+        if (serializedValue == null) {
+            statement.setNull(index, Types.NULL);
+            return;
+        }
+        if (trinoTypeName.equals("boolean")) {
+            statement.setBoolean(index, Boolean.parseBoolean(serializedValue));
+        }
+        else if (trinoTypeName.equals("tinyint")) {
+            statement.setByte(index, Byte.parseByte(serializedValue));
+        }
+        else if (trinoTypeName.equals("smallint")) {
+            statement.setShort(index, Short.parseShort(serializedValue));
+        }
+        else if (trinoTypeName.equals("integer")) {
+            statement.setInt(index, Integer.parseInt(serializedValue));
+        }
+        else if (trinoTypeName.equals("bigint")) {
+            statement.setLong(index, Long.parseLong(serializedValue));
+        }
+        else if (trinoTypeName.equals("real")) {
+            statement.setFloat(index, Float.parseFloat(serializedValue));
+        }
+        else if (trinoTypeName.equals("double")) {
+            statement.setDouble(index, Double.parseDouble(serializedValue));
+        }
+        else if (trinoTypeName.startsWith("decimal(")) {
+            statement.setBigDecimal(index, new BigDecimal(serializedValue));
+        }
+        else {
+            statement.setString(index, serializedValue);
         }
     }
 
@@ -1345,4 +1515,8 @@ public class StarrocksFEClient
         long jitter = ThreadLocalRandom.current().nextLong(250L);
         endpointPenaltyUntil.put(endpoint, System.currentTimeMillis() + backoff + jitter);
     }
+
+    private record ParameterizedPredicate(String sql, List<BoundValue> params) {}
+
+    private record BoundValue(String trinoTypeName, String serializedValue) {}
 }

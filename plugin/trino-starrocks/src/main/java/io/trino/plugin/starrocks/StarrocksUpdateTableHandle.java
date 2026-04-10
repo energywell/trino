@@ -17,8 +17,7 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.trino.spi.connector.ConnectorTableHandle;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.List;
 
 import static java.util.Objects.requireNonNull;
 
@@ -26,15 +25,15 @@ public class StarrocksUpdateTableHandle
         implements ConnectorTableHandle
 {
     private final StarrocksTableHandle tableHandle;
-    private final Map<String, String> assignments;
+    private final List<StarrocksAssignment> assignments;
 
     @JsonCreator
     public StarrocksUpdateTableHandle(
             @JsonProperty("tableHandle") StarrocksTableHandle tableHandle,
-            @JsonProperty("assignments") Map<String, String> assignments)
+            @JsonProperty("assignments") List<StarrocksAssignment> assignments)
     {
         this.tableHandle = requireNonNull(tableHandle, "tableHandle is null");
-        this.assignments = Map.copyOf(new LinkedHashMap<>(requireNonNull(assignments, "assignments is null")));
+        this.assignments = List.copyOf(requireNonNull(assignments, "assignments is null"));
     }
 
     @JsonProperty
@@ -44,7 +43,7 @@ public class StarrocksUpdateTableHandle
     }
 
     @JsonProperty
-    public Map<String, String> getAssignments()
+    public List<StarrocksAssignment> getAssignments()
     {
         return assignments;
     }

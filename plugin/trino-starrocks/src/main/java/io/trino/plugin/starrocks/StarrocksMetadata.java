@@ -52,23 +52,12 @@ import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.security.TrinoPrincipal;
 import io.trino.spi.statistics.ComputedStatistics;
 import io.trino.spi.statistics.TableStatistics;
-import io.trino.spi.type.BigintType;
-import io.trino.spi.type.BooleanType;
-import io.trino.spi.type.DateType;
 import io.trino.spi.type.DecimalType;
-import io.trino.spi.type.DoubleType;
-import io.trino.spi.type.IntegerType;
-import io.trino.spi.type.RealType;
-import io.trino.spi.type.SmallintType;
-import io.trino.spi.type.StandardTypes;
-import io.trino.spi.type.TimestampType;
-import io.trino.spi.type.TinyintType;
 import io.trino.spi.type.Type;
-import io.trino.spi.type.VarcharType;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -675,12 +664,19 @@ public class StarrocksMetadata
             return Optional.empty();
         }
 
-        LinkedHashMap<String, String> assignmentLiterals = new LinkedHashMap<>();
+        List<StarrocksAssignment> assignmentList = new ArrayList<>();
         for (Map.Entry<ColumnHandle, Constant> entry : assignments.entrySet()) {
             StarrocksColumnHandle columnHandle = (StarrocksColumnHandle) entry.getKey();
-            assignmentLiterals.put(columnHandle.getColumnName(), formatLiteral(entry.getValue()));
+            Constant constant = entry.getValue();
+            Type type = constant.getType();
+            Object nativeValue = constant.getValue();
+            Object objectValue = type.getObjectValue(nativeValueToBlock(type, nativeValue), 0);
+            assignmentList.add(new StarrocksAssignment(
+                    columnHandle.getColumnName(),
+                    type.getDisplayName(),
+                    toSerializedString(objectValue, type)));
         }
-        return Optional.of(new StarrocksUpdateTableHandle(tableHandle, assignmentLiterals));
+        return Optional.of(new StarrocksUpdateTableHandle(tableHandle, assignmentList));
     }
 
     @Override
@@ -689,32 +685,15 @@ public class StarrocksMetadata
         return client.getFeClient().executeUpdate(session, (StarrocksUpdateTableHandle) handle, client.getConfig().getTupleDomainLimit());
     }
 
-    private String formatLiteral(Constant constant)
+    private static String toSerializedString(Object value, Type type)
     {
-        Type type = constant.getType();
-        Object nativeValue = constant.getValue();
-        Object value = type.getObjectValue(nativeValueToBlock(type, nativeValue), 0);
         if (value == null) {
-            return "NULL";
+            return null;
         }
-        if (type instanceof VarcharType || type instanceof DateType || type instanceof TimestampType) {
-            return "'" + value.toString().replace("'", "''") + "'";
-        }
-        if (type instanceof BigintType || type instanceof IntegerType || type instanceof SmallintType || type instanceof TinyintType) {
-            return value.toString();
-        }
-        if (type instanceof DoubleType || type instanceof RealType || type instanceof DecimalType) {
+        if (type instanceof DecimalType) {
             return new BigDecimal(value.toString()).toPlainString();
         }
-        if (type instanceof BooleanType) {
-            return ((Boolean) value) ? "1" : "0";
-        }
-        if (type.getBaseName().equals(StandardTypes.JSON)) {
-            String json = value.toString().replace("'", "''");
-            return "parse_json('" + json + "')";
-        }
-
-        throw new TrinoException(NOT_SUPPORTED, "Unsupported UPDATE literal type: " + type.getDisplayName());
+        return value.toString();
     }
 
     @Override
