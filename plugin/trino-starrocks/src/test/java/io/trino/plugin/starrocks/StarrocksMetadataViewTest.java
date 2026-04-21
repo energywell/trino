@@ -178,10 +178,11 @@ public class StarrocksMetadataViewTest
                 OptionalLong.empty(),
                 Optional.empty());
 
-        StarrocksTableHandle pushedHandle = (StarrocksTableHandle) metadata.applyLimit(SESSION, tableHandle, 100)
-                .orElseThrow()
-                .getHandle();
+        var limitResult = metadata.applyLimit(SESSION, tableHandle, 100)
+                .orElseThrow();
+        StarrocksTableHandle pushedHandle = (StarrocksTableHandle) limitResult.getHandle();
 
+        assertThat(limitResult.isLimitGuaranteed()).isFalse();
         assertThat(pushedHandle.getLimit()).hasValue(100);
     }
 
@@ -200,15 +201,16 @@ public class StarrocksMetadataViewTest
                 OptionalLong.empty(),
                 Optional.empty());
 
-        StarrocksTableHandle pushedHandle = (StarrocksTableHandle) metadata.applyTopN(
+        var topNResult = metadata.applyTopN(
                 SESSION,
                 tableHandle,
                 10,
                 List.of(new SortItem("c1", SortOrder.DESC_NULLS_LAST)),
                 Map.of("c1", column))
-                .orElseThrow()
-                .getHandle();
+                .orElseThrow();
+        StarrocksTableHandle pushedHandle = (StarrocksTableHandle) topNResult.getHandle();
 
+        assertThat(topNResult.isTopNGuaranteed()).isFalse();
         assertThat(pushedHandle.getLimit()).hasValue(10);
         assertThat(pushedHandle.getSortOrder()).isPresent();
         assertThat(pushedHandle.getSortOrder().orElseThrow())

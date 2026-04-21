@@ -472,7 +472,7 @@ public class StarrocksMetadata
                 OptionalLong.of(limit),
                 handle.getSortOrder());
 
-        return Optional.of(new LimitApplicationResult<>(updatedHandle, true, false));
+        return Optional.of(new LimitApplicationResult<>(updatedHandle, false, false));
     }
 
     @Override
@@ -529,7 +529,7 @@ public class StarrocksMetadata
                 OptionalLong.of(pushedLimit),
                 Optional.of(normalizedSortItems));
 
-        return Optional.of(new TopNApplicationResult<>(updatedHandle, true, false));
+        return Optional.of(new TopNApplicationResult<>(updatedHandle, false, false));
     }
 
     @Override

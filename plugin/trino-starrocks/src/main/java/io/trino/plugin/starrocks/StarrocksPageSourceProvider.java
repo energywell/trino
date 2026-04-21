@@ -25,6 +25,7 @@ import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.DynamicFilter;
 
 import java.util.List;
+import java.util.OptionalLong;
 
 import static java.util.Objects.requireNonNull;
 
@@ -55,6 +56,9 @@ public class StarrocksPageSourceProvider
         StarrocksBeReader beReader = new StarrocksBeReader(client.getConfig(), starrocksSplit.getBeNode(), columns, table.getSchemaTableName());
         beReader.openScanner(starrocksSplit.getTabletId(), starrocksSplit.getOpaquedQueryPlan());
 
-        return new StarrocksPageSource(beReader, columns, typeMapper);
+        // Only enforce the limit per-split for unordered queries. For ORDER BY ... LIMIT N,
+        // each split must return all rows so Trino's TopN operator can find the true global top N.
+        OptionalLong pageSourceLimit = table.getSortOrder().isPresent() ? OptionalLong.empty() : table.getLimit();
+        return new StarrocksPageSource(beReader, columns, typeMapper, pageSourceLimit);
     }
 }

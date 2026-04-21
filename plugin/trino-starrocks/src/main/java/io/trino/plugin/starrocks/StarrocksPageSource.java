@@ -31,6 +31,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.OptionalLong;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
@@ -44,13 +45,15 @@ public class StarrocksPageSource
     private final List<StarrocksColumnHandle> columnHandles;
     private final List<Type> types;
 
+    private final OptionalLong limit;
+    private long rowsRead;
     private boolean finished;
     private long readTimeNanos;
     private long completedBytes;
     private ArrowStreamReader currentArrowReader;
     private RootAllocator rootAllocator;
 
-    public StarrocksPageSource(StarrocksBeReader beReader, List<ColumnHandle> columns, StarrocksTypeMapper typeMapper)
+    public StarrocksPageSource(StarrocksBeReader beReader, List<ColumnHandle> columns, StarrocksTypeMapper typeMapper, OptionalLong limit)
     {
         this.beReader = requireNonNull(beReader, "beReader is null");
         this.typeMapper = requireNonNull(typeMapper, "typeMapper is null");
@@ -60,6 +63,7 @@ public class StarrocksPageSource
         this.types = columnHandles.stream()
                 .map(col -> typeMapper.toTrinoType(col.getType(), col.getColumnType(), col.getColumnSize(), col.getDecimalDigits()))
                 .collect(toImmutableList());
+        this.limit = requireNonNull(limit, "limit is null");
         this.rootAllocator = new RootAllocator(2147483647L);
     }
 
@@ -112,12 +116,27 @@ public class StarrocksPageSource
                 return null;
             }
 
+            int effectiveRowCount = root.getRowCount();
+            if (limit.isPresent()) {
+                long remaining = limit.getAsLong() - rowsRead;
+                if (remaining <= 0) {
+                    finished = true;
+                    return null;
+                }
+                effectiveRowCount = (int) Math.min(root.getRowCount(), remaining);
+            }
+
             BlockBuilder[] blockBuilders = new BlockBuilder[columnHandles.size()];
 
             for (int i = 0; i < columnHandles.size(); i++) {
                 Type type = types.get(i);
                 int dataPosition = columnHandles.get(i).getOrdinalPosition() - 1;
-                blockBuilders[i] = convertToTrinoBlock(fieldVectors.get(i), type, root.getRowCount(), dataPosition, blockBuilders[i]);
+                blockBuilders[i] = convertToTrinoBlock(fieldVectors.get(i), type, effectiveRowCount, dataPosition, blockBuilders[i]);
+            }
+
+            rowsRead += effectiveRowCount;
+            if (limit.isPresent() && rowsRead >= limit.getAsLong()) {
+                finished = true;
             }
 
             completedBytes += estimateBatchSize(fieldVectors);
@@ -125,7 +144,7 @@ public class StarrocksPageSource
             beReader.setReaderOffset(beReader.getReaderOffset() + root.getRowCount());
             Block[] blocks = Arrays.stream(blockBuilders).map(BlockBuilder::build).toArray(Block[]::new);
             fieldVectors.forEach(FieldVector::clear);
-            return SourcePage.create(new Page(root.getRowCount(), blocks));
+            return SourcePage.create(new Page(effectiveRowCount, blocks));
         }
         catch (IOException e) {
             throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to read next Arrow batch", e);
