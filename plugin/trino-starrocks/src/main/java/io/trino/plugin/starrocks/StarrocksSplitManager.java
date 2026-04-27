@@ -25,6 +25,7 @@ import io.trino.spi.connector.DynamicFilter;
 import io.trino.spi.connector.FixedSplitSource;
 import io.trino.spi.predicate.TupleDomain;
 
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static io.trino.spi.connector.DynamicFilter.NOT_BLOCKED;
@@ -56,9 +57,20 @@ public class StarrocksSplitManager
             DynamicFilter dynamicFilter,
             Constraint constraint)
     {
-        long timeoutMillis = StarrocksSessionProperties.getDynamicFilteringWaitTimeout(session).toMillis();
         int tupleDomainLimit = StarrocksSessionProperties.getTupleDomainLimit(session);
         StarrocksTableHandle starrocksTableHandle = (StarrocksTableHandle) table;
+
+        if (starrocksTableHandle.getJoinSqlBase().isPresent()) {
+            StarrocksAggregateSplit split = client.getFeClient().buildJoinSplit(starrocksTableHandle, tupleDomainLimit);
+            return new FixedSplitSource(List.of(split));
+        }
+
+        if (starrocksTableHandle.getPushdownAggregates().isPresent()) {
+            StarrocksAggregateSplit split = client.getFeClient().buildAggregateSplit(starrocksTableHandle, tupleDomainLimit);
+            return new FixedSplitSource(List.of(split));
+        }
+
+        long timeoutMillis = StarrocksSessionProperties.getDynamicFilteringWaitTimeout(session).toMillis();
         if (timeoutMillis == 0 || !dynamicFilter.isAwaitable()) {
             return getSplitSource(
                     table,

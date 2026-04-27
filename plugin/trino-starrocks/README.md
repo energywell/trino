@@ -1,247 +1,413 @@
-# Trino StarRocks Connector: Post-Remediation Production Readiness Reassessment
+# StarRocks Connector for Trino
 
-## Verdict
+A Trino connector for [StarRocks](https://www.starrocks.io/) that reads data directly from BE (backend) nodes via the Arrow-based scan API and executes aggregate and join queries via a JDBC connection to the FE (frontend).
 
-Current status: **production-ready for staged rollout**.
+---
 
-The previous P0-A and P1-A blockers were implemented:
+## Contents
 
-- write path now uses explicit Stream Load transactions with commit/rollback,
-- write buffering is bounded and chunked,
-- failure-path transaction behavior is covered by targeted tests.
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+- [Session Properties](#session-properties)
+- [Type Mapping](#type-mapping)
+- [Query Push-downs](#query-push-downs)
+- [Split Strategy](#split-strategy)
+- [Schema and Table Management](#schema-and-table-management)
+- [Views and Materialized Views](#views-and-materialized-views)
+- [Write Support](#write-support)
+- [Resilience](#resilience)
+- [Developer Runbook](#developer-runbook)
 
-Module checks and tests are green.
+---
 
-## What was reassessed
+## Architecture
 
-- Connector lifecycle and DI wiring
-- Configuration validation and operational controls
-- FE/BE/StreamLoad timeout and error handling
-- Read/write path behavior
-- Handle correctness and metadata null-safety
-- Unit test coverage and build status
+The connector uses two data paths depending on the query shape.
 
-## Validation snapshot
+**Regular scans** — The FE is queried for a tablet routing plan over HTTP. Trino creates one split per tablet batch, and each split streams rows directly from the responsible BE node using the Arrow-based scan API. Predicates, column projections, and LIMIT are applied at the BE level to minimise transferred data.
 
-- Local static checks: pass (no IDE errors)
-- Module tests: pass
-- Command used:
+**Aggregate and join queries** — When aggregations or joins are pushed down, the connector generates a single SQL statement and executes it over JDBC against the FE. The FE runs the query natively and returns results, which are read back via a JDBC `ResultSet`.
 
-```bash
-./mvnw -pl plugin/trino-starrocks test -DskipITs -DfailIfNoTests=false
+---
+
+## Configuration
+
+Set these properties in `etc/catalog/<catalog-name>.properties`.
+
+### Connection
+
+| Property | Required | Default | Description |
+|---|---|---|---|
+| `connector.name` | yes | — | Must be `starrocks` |
+| `jdbc-url` | yes | — | JDBC URL for the StarRocks FE. Example: `jdbc:mysql://host:9030` |
+| `scan-url` | yes | — | HTTP endpoint(s) for StarRocks BE nodes. Example: `host:8030`. Comma-separated for multiple nodes. |
+| `username` | yes | — | StarRocks user |
+| `password` | no | _(empty)_ | Password for the StarRocks user |
+
+### Timeouts
+
+| Property | Default | Min | Description |
+|---|---|---|---|
+| `scan-connect-timeout` | `1s` | `1ms` | Timeout for establishing FE/BE network connections |
+| `scan-read-timeout` | `30s` | `1ms` | Timeout for HTTP reads from FE and BE |
+| `scan-write-timeout` | `30s` | `1ms` | Timeout for HTTP writes (stream load) |
+| `scan-query-timeout` | `10m` | `1ms` | Timeout covering the FE query plan request and the BE scan |
+| `scan-keep-alive` | `1m` | `1ms` | Keep-alive duration for the BE scanner connection |
+
+### Scan Behaviour
+
+| Property | Default | Min | Description |
+|---|---|---|---|
+| `scan-batch-rows` | `1000` | `1` | Row batch size for the BE Arrow scanner and for stream-load write buffering |
+| `scan-tablets-per-split` | `16` | `1` | Maximum tablets grouped into one Trino split. Lower values increase read parallelism; higher values reduce split scheduling overhead. |
+| `scan-max-retries` | `3` | `1` | Maximum retry attempts for FE query plan requests |
+
+### Dynamic Filtering and Predicates
+
+| Property | Default | Min | Description |
+|---|---|---|---|
+| `dynamic-filtering-wait-timeout` | `10s` | `0ms` | How long to wait for dynamic filters before generating splits. Set to `0ms` to disable waiting. |
+| `tuple-domain-limit` | `1000` | `1` | Maximum number of discrete values in a pushed-down IN-list predicate. Predicates exceeding this limit are not pushed to StarRocks. |
+
+### Example
+
+```properties
+connector.name=starrocks
+jdbc-url=jdbc:mysql://starrocks-fe:9030
+scan-url=starrocks-be-1:8030,starrocks-be-2:8030
+username=admin
+password=secret
+scan-tablets-per-split=8
+scan-query-timeout=5m
+dynamic-filtering-wait-timeout=15s
 ```
 
-## Query performance optimizations implemented
+---
 
-### O1. Limit and TopN pushdown
+## Session Properties
 
-- Added connector-level `applyLimit` and `applyTopN` pushdown handling.
-- `StarrocksTableHandle` now carries pushed-down `limit` and `sortOrder` state.
-- FE SQL generation now emits `ORDER BY` and `LIMIT` when present.
+Session properties override the corresponding catalog-level config for a single query session.
 
-Impact:
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `dynamic_filtering_wait_timeout` | duration | from config | Dynamic filter wait timeout |
+| `tuple_domain_limit` | integer | from config | IN-list predicate size limit |
 
-- less data transferred from StarRocks to Trino for top-k queries,
-- lower Trino worker CPU for order+limit workloads,
-- better response times for dashboard-style queries.
+```sql
+SET SESSION starrocks.tuple_domain_limit = 500;
+SET SESSION starrocks.dynamic_filtering_wait_timeout = '30s';
+```
 
-### O2. Split compaction (tablet grouping)
+---
 
-- Added `scan-tablets-per-split` configuration.
-- Split builder now groups multiple tablets per split instead of one-tablet-per-split.
+## Type Mapping
 
-Impact:
+### StarRocks → Trino
 
-- fewer splits created and scheduled,
-- reduced planning and coordinator overhead,
-- improved throughput on high-tablet tables.
+| StarRocks Type | Trino Type | Notes |
+|---|---|---|
+| `boolean` | `BOOLEAN` | |
+| `tinyint` | `TINYINT` | `tinyint(1)` maps to `BOOLEAN` |
+| `smallint` | `SMALLINT` | |
+| `int` / `integer` | `INTEGER` | |
+| `bigint` | `BIGINT` | |
+| `bigint unsigned` | `DECIMAL(38, 0)` | No unsigned integer type in Trino |
+| `largeint` | `DECIMAL(38, 0)` | StarRocks 128-bit integer |
+| `float` | `REAL` | |
+| `double` | `DOUBLE` | |
+| `decimal(p, s)` | `DECIMAL(p, s)` | Precision and scale preserved |
+| `decimal32` / `decimal64` / `decimal128` / `decimalv2` | `DECIMAL` | |
+| `char(n)` | `VARCHAR` | |
+| `varchar(n)` | `VARCHAR(n)` | Values wider than 65,533 chars use unbounded `VARCHAR` |
+| `string` | `VARCHAR` | Unbounded |
+| `varbinary` | `VARBINARY` | |
+| `date` | `DATE` | |
+| `datetime` | `TIMESTAMP(3)` | Millisecond precision |
+| `json` | `JSON` | |
+| `array<T>` | `ARRAY(Trino(T))` | Recursive element mapping |
+| `map<K, V>` | `MAP(Trino(K), Trino(V))` | Recursive key/value mapping |
+| `struct<f1 T1, f2 T2, ...>` | `ROW(f1 Trino(T1), f2 Trino(T2), ...)` | Field names preserved |
 
-### O3. FE endpoint health-aware retries
+### Trino → StarRocks
 
-- FE query-plan path now chooses endpoints with temporary failure penalties.
-- Added jittered exponential backoff between retries.
-- Endpoint success/failure feedback now influences subsequent selection.
+| Trino Type | StarRocks Type |
+|---|---|
+| `BOOLEAN` | `boolean` |
+| `TINYINT` | `tinyint` |
+| `SMALLINT` | `smallint` |
+| `INTEGER` | `int` |
+| `BIGINT` | `bigint` |
+| `REAL` | `float` |
+| `DOUBLE` | `double` |
+| `DECIMAL(p, s)` | `decimal(p, s)` |
+| `CHAR(n)` | `char(n)` |
+| `VARCHAR(n)` | `varchar(n)` (or `string` if n > 65,533) |
+| `VARBINARY` | `varbinary` |
+| `DATE` | `date` |
+| `TIMESTAMP` | `datetime` |
+| `JSON` | `json` |
+| `ARRAY(T)` | `array<StarRocks(T)>` |
+| `MAP(K, V)` | `map<StarRocks(K), StarRocks(V)>` |
+| `ROW(...)` | `struct<field StarRocks(T), ...>` |
 
-Impact:
+---
 
-- lower tail latency under transient FE node issues,
-- fewer avoidable query failures due to endpoint flaps,
-- better resilience in multi-FE deployments.
+## Query Push-downs
 
-## Pushdown scope
+The connector implements a full stack of push-downs. When a push-down applies, the work is done inside StarRocks rather than Trino, reducing data transfer and coordinator CPU usage.
 
-- Pushdown applies to query fragments handled by this StarRocks connector.
-- Cross-catalog joins (for example StarRocks joined with PostgreSQL) are executed by Trino and are not fully join-pushed into StarRocks.
-- Best performance is achieved when heavy filtering, topN, aggregation, and joins stay within StarRocks-side query fragments.
+### Projection push-down
 
-## Developer runbook: running the server locally
+Only the columns referenced by the query are requested from StarRocks. Unreferenced columns are never transferred.
 
-The stable server lives at `~/trino-server-480-SNAPSHOT/`. Config (including `starrocks.properties`) lives there permanently and is never overwritten by rebuilds. Connect to it from DBeaver using the Trino driver at `localhost:8080`.
+### Predicate push-down
 
-### If only `starrocks.properties` changed (no code changes)
+Column predicates derived from `WHERE` clauses are pushed to the StarRocks scan. For regular scans these become tablet-level filters at the BE; for aggregate and join queries they become `WHERE` clauses in the generated SQL.
+
+| Shape | SQL example |
+|---|---|
+| Equality | `col = value` |
+| Inequality | `col <> value` |
+| Range | `col >= x AND col <= y` |
+| Open range | `col > x`, `col < y` |
+| IN list | `col IN (a, b, c)` |
+| IS NULL | `col IS NULL` |
+| IS NOT NULL | `col IS NOT NULL` |
+| NULL-inclusive range | `col IS NULL OR col >= x` |
+
+IN-list predicates exceeding `tuple-domain-limit` are not pushed and are evaluated by Trino instead.
+
+### Expression push-down
+
+Compound filter conditions (LIKE, cross-column OR, etc.) are translated to SQL and pushed alongside the column predicates.
+
+| Trino operator | SQL |
+|---|---|
+| `$equal` | `=` |
+| `$not_equal` | `<>` |
+| `$less_than` | `<` |
+| `$less_than_or_equal` | `<=` |
+| `$greater_than` | `>` |
+| `$greater_than_or_equal` | `>=` |
+| `$like` | `LIKE` |
+| `$is_null` | `IS NULL` |
+| `$and` | `AND` |
+| `$or` | `OR` |
+| `$not` | `NOT` |
+
+Expressions that cannot be fully translated are left in Trino (partial push-down). When an expression is fully translated it is embedded into the per-side subquery for join queries and into the `WHERE` clause for aggregate queries; the residual expression returned to Trino is `TRUE`.
+
+### Limit push-down
+
+`LIMIT n` is pushed to StarRocks. For regular scans the limit is applied per split at the BE level, capping how many rows each split returns before Trino applies the final global limit.
+
+### TopN push-down (ORDER BY … LIMIT)
+
+When a query contains `ORDER BY` and `LIMIT`, the combined top-N is pushed to StarRocks.
+
+**NULL ordering note:** StarRocks sorts NULLs as smaller than all non-NULL values (NULLs first on ASC, last on DESC). Trino's default is ASC NULLS LAST / DESC NULLS FIRST. To avoid wrong results from per-split pre-limiting with mismatched NULL placement, the per-split row cap is suppressed when a sort order is present — each split returns all its rows, and Trino's TopN operator handles the global sort and final limit correctly.
+
+### Aggregate push-down
+
+The following aggregate functions are pushed to StarRocks and executed as a single JDBC query:
+
+| Function | DISTINCT supported |
+|---|---|
+| `COUNT(*)` | — |
+| `COUNT(col)` | yes |
+| `SUM(col)` | yes |
+| `MIN(col)` | no |
+| `MAX(col)` | no |
+| `AVG(col)` | no |
+
+**Constraints:**
+- Single grouping set only. `GROUPING SETS`, `ROLLUP`, and `CUBE` are not pushed.
+- Aggregate functions with a `FILTER (WHERE ...)` clause or an inline `ORDER BY` are not pushed.
+- Aggregation is not pushed when the handle already carries a join push-down.
+
+Post-aggregation filters (`HAVING`) are pushed as a `HAVING` clause in the generated SQL.
+
+Generated SQL shape:
+
+```sql
+SELECT col1, col2,
+       COUNT(*) AS `_agg_0`,
+       SUM(amount) AS `_agg_1`
+FROM `schema`.`table`
+WHERE col1 >= 10
+GROUP BY col1, col2
+HAVING `_agg_0` > 100
+LIMIT 1000
+```
+
+### Join push-down
+
+Two-table joins where both sides are StarRocks tables in the same catalog are pushed as a single JDBC query to the FE.
+
+**Supported join types:** `INNER JOIN`, `LEFT OUTER JOIN`, `RIGHT OUTER JOIN`, `FULL OUTER JOIN`
+
+**Supported join conditions:** Any translatable expression using the operators listed in the expression push-down section.
+
+**Predicate placement — outer join correctness:** Each side's predicates (both column and expression filters) are applied inside per-side subqueries rather than in a flat outer `WHERE` clause. A predicate in an outer `WHERE` would silently filter null-extended rows and convert any `OUTER JOIN` to an `INNER JOIN`. The subquery structure prevents this.
+
+**Constraints:**
+- Nested join push-down is not supported (a join on top of an already-pushed join).
+- Joins where either side carries an aggregation push-down are not pushed.
+- The join condition must be fully translatable; untranslatable conditions fall back to Trino.
+
+Generated SQL shape:
+
+```sql
+SELECT _l.`col1` AS `_lc_0`, _l.`col2` AS `_lc_1`,
+       _r.`col3` AS `_rc_0`
+FROM   (SELECT * FROM `schema`.`left_table`
+        WHERE col1 = 5 AND (`name` LIKE 'Alice%')) AS _l
+LEFT OUTER JOIN
+       (SELECT * FROM `schema`.`right_table`
+        WHERE col3 < 100) AS _r
+ON _l.`id` = _r.`left_id`
+```
+
+Output columns are aliased as `_lc_0, _lc_1, ...` (left) and `_rc_0, _rc_1, ...` (right) and mapped back to the original Trino column handles.
+
+### Dynamic filter integration
+
+The split manager waits up to `dynamic-filtering-wait-timeout` for broadcast hash join dynamic filters to become available before generating splits. Dynamic filter predicates are merged with the table's static constraints and pushed to the BE scanner, allowing entire tablets to be skipped before any data is transferred.
+
+---
+
+## Split Strategy
+
+### Regular table scans
+
+1. The connector sends the column list and predicate to the FE via `/api/schema/table/_query_plan`.
+2. The FE returns a map of `BE address → tablet list`.
+3. Tablets are grouped per BE and batched by `scan-tablets-per-split`.
+4. Each Trino split carries: a BE address, a list of tablet IDs, and the opaque query plan blob from the FE.
+
+Example with `scan-tablets-per-split=2` and 5 tablets on BE-1:
+
+| Split | BE | Tablets |
+|---|---|---|
+| 1 | BE-1 | [1, 2] |
+| 2 | BE-1 | [3, 4] |
+| 3 | BE-1 | [5] |
+
+### Aggregate and join queries
+
+A single `StarrocksAggregateSplit` is generated containing the complete SQL statement. All computation happens in StarRocks via one JDBC execution. Outer `WHERE`, `ORDER BY`, and `LIMIT` from the handle state are appended to the join subquery wrapper when present.
+
+---
+
+## Schema and Table Management
+
+| Operation | Supported |
+|---|---|
+| `SHOW SCHEMAS` | yes |
+| `CREATE SCHEMA` | yes |
+| `DROP SCHEMA` | yes (must be empty) |
+| `RENAME SCHEMA` | yes |
+| `SHOW TABLES` | yes |
+| `CREATE TABLE` | yes |
+| `CREATE TABLE AS SELECT` | yes |
+| `DROP TABLE` | yes |
+| `RENAME TABLE` | yes |
+| `ADD COLUMN` | yes |
+| `DROP COLUMN` | yes |
+| `RENAME COLUMN` | yes |
+| `ALTER COLUMN TYPE` | yes |
+| Table row-count statistics | yes (via `INFORMATION_SCHEMA.TABLES`) |
+
+The following built-in StarRocks schemas are hidden from schema and table listings:
+`information_schema`, `_statistics_`, `sys`
+
+---
+
+## Views and Materialized Views
+
+| Operation | Supported |
+|---|---|
+| `CREATE VIEW` | yes |
+| `DROP VIEW` | yes |
+| `RENAME VIEW` | yes |
+| `CREATE MATERIALIZED VIEW` | yes |
+| `DROP MATERIALIZED VIEW` | yes |
+| `REFRESH MATERIALIZED VIEW` | yes |
+| Materialized view freshness | yes |
+
+Materialized view freshness is reported using the StarRocks `LAST_REFRESH_FINISHED_TIME` field. The state is `FRESH` when a refresh timestamp is available and `UNKNOWN` otherwise.
+
+---
+
+## Write Support
+
+### INSERT (Stream Load)
+
+Rows written via `INSERT INTO` are sent to StarRocks using the HTTP Stream Load transaction API:
+
+1. `POST /api/transaction/begin` — opens a transaction
+2. `POST /api/transaction/load` — streams row data in batches (batch size = `scan-batch-rows`)
+3. `POST /api/transaction/prepare` — prepares the transaction
+4. `POST /api/transaction/commit` — commits
+5. `POST /api/transaction/rollback` — called on any failure, including commit failure
+
+Write memory is bounded by `scan-batch-rows`. Batches are flushed and sent before accumulating more rows.
+
+### UPDATE
+
+`UPDATE … WHERE` is pushed to StarRocks over JDBC when the predicate is translatable.
+
+---
+
+## Resilience
+
+### BE endpoint failover
+
+When `scan-url` lists multiple BE endpoints, the connector tracks failures per endpoint. Failed endpoints receive a temporary penalty with jittered exponential backoff (up to 30 seconds). Healthy endpoints are selected at random. This allows the connector to continue operating when one or more BE nodes are temporarily unavailable.
+
+### FE query plan retries
+
+FE query plan HTTP requests are retried up to `scan-max-retries` times (default: 3) with backoff before the query is failed.
+
+### JDBC connection cleanup
+
+JDBC connections for aggregate and join queries are explicitly lifecycle-managed:
+- If a connection is opened but query execution fails during initialisation, the connection is closed before the exception propagates.
+- If a `Statement` is created but `executeQuery` fails, the statement is closed before the exception propagates.
+
+---
+
+## Developer Runbook
+
+The stable local server lives at `~/trino-server-480-SNAPSHOT/`. Config (including `starrocks.properties`) lives there and is never overwritten by plugin rebuilds. Connect from DBeaver using the Trino JDBC driver at `localhost:8080`.
+
+### Config-only change (no code changed)
 
 ```bash
-# Edit the config directly in the stable server directory
 nano ~/trino-server-480-SNAPSHOT/etc/catalog/starrocks.properties
-
-# Restart
-cd ~/trino-server-480-SNAPSHOT
-bin/launcher stop && bin/launcher start
+cd ~/trino-server-480-SNAPSHOT && bin/launcher stop && bin/launcher start
 ```
 
-### If connector code changed
+### Connector code changed
 
 ```bash
 cd /Users/stevenchung/Documents/Work/energywell/trino
 
-# 1. Build and test the plugin — use install, not package
+# 1. Test and install the plugin into the local Maven repository
 ./mvnw -pl plugin/trino-starrocks test -DskipITs -DfailIfNoTests=false
 ./mvnw -pl plugin/trino-starrocks -DskipTests install
 
 # 2. Rebuild the server distribution
 ./mvnw -pl core/trino-server -am -DskipTests clean package
 
-# 3. Copy the new plugins into the stable server (etc/ is not touched)
+# 3. Copy new plugins into the stable server (etc/ is not touched)
 cp -r core/trino-server/target/trino-server-480-SNAPSHOT/plugin ~/trino-server-480-SNAPSHOT/
 
 # 4. Restart
-cd ~/trino-server-480-SNAPSHOT
-bin/launcher stop && bin/launcher start
-```
+cd ~/trino-server-480-SNAPSHOT && bin/launcher stop && bin/launcher start
 
-### Verify startup
-
-```bash
+# 5. Verify
 curl -s http://localhost:8080/v1/info
 ```
 
-### Notes
-
-- Use `install` in step 1, not `package`. `package` only builds the jar locally; `install` puts it in the local Maven repository so the server rebuild in step 2 picks it up instead of pulling the older remote snapshot.
-- Only `plugin/` is copied in step 3 — `etc/` is left alone so your config changes are preserved.
-- The stable server directory (`~/trino-server-480-SNAPSHOT/`) is set up once. If you need to recreate it from scratch: `tar -xzf core/trino-server/target/trino-server-480-SNAPSHOT.tar.gz -C ~/` then copy `etc/` in manually.
-
-## Resolved since last assessment
-
-### R1. DI wiring corrected
-
-- `StarrocksConnctor` now uses injected split/page providers and table properties.
-- Status: resolved.
-- Impact: cleaner lifecycle behavior and better maintainability.
-
-### R2. Config model normalized and expanded
-
-- `StarrocksConfig` now exposes and validates timeout/scanner/retry settings.
-- Status: resolved.
-- Impact: operators can tune network and scanner behavior safely.
-
-### R3. Metadata null handling fixed
-
-- `Optional.ofNullable` now used for nullable metadata comment/extra fields.
-- Status: resolved.
-- Impact: avoids runtime NPE on legitimate metadata values.
-
-### R4. Table handle equality contract fixed
-
-- `hashCode` now aligns with `equals` field set.
-- Status: resolved.
-- Impact: removes planner/cache nondeterminism risk.
-
-### R5. Timeout and error typing hardening
-
-- FE and stream-load HTTP clients now use explicit connect/read/write/call timeouts.
-- BE scanner now uses configured timeout and typed connector exceptions.
-- Page source and split source now emit typed `TrinoException` in failure paths.
-- Status: largely resolved.
-- Impact: reduced hang risk and improved observability.
-
-### R6. Test drift fixed and regressions added
-
-- Endpoint expectation test aligned with implementation.
-- Added regression tests for metadata null handling and table-handle equality contract.
-- Status: resolved.
-
-## Resolved blockers
-
-### P0-A. Transactional write semantics with explicit commit/abort
-
-Status: resolved.
-
-What changed:
-
-- `StarrocksPageSink` now uses StarRocks Stream Load transaction endpoints:
-- `/api/transaction/begin`
-- `/api/transaction/load` (chunked writes)
-- `/api/transaction/prepare`
-- `/api/transaction/commit`
-- `/api/transaction/rollback`
-- `finish()` now performs `prepare + commit`.
-- `abort()` now performs explicit `rollback`.
-- buffering is bounded by configured `scan-batch-rows`, avoiding unbounded memory growth.
-
-Impact:
-
-- explicit atomic lifecycle for connector-managed writes,
-- lower OOM risk on large inserts,
-- clearer behavior on failure paths.
-
-### P1-A. Failure-path coverage for transaction lifecycle
-
-Status: resolved for connector-level transaction logic.
-
-What changed:
-
-- Added `StarrocksPageSinkTransactionTest` with failure-oriented scenarios:
-- successful `begin/load/prepare/commit` flow,
-- explicit rollback on `abort()`,
-- rollback attempted when commit fails.
-
-Impact:
-
-- key transaction control flows are now exercised automatically,
-- regressions in commit/rollback sequencing are caught by tests.
-
-Scope note:
-
-- these are fast connector-level tests using an in-process HTTP stub.
-- full end-to-end cluster fault-injection remains recommended for very high-risk production environments.
-
-## High-priority hardening still recommended
-
-### H1. Security transport posture
-
-- Endpoint normalization still defaults missing scheme to `http://`.
-- Recommendation: require explicit scheme or prefer `https://` default for production.
-
-### H2. SQL log redaction
-
-- FE client logs full DDL/UPDATE SQL on failures.
-- Recommendation: redact literals or log structured metadata instead.
-
-### H3. Endpoint health awareness
-
-- FE query-plan path now uses health-aware endpoint selection with temporary failure penalties.
-- Recommendation: extend the same policy to all FE/StreamLoad call paths for consistency.
-
-## Updated severity view
-
-- **P2**
-- Secure transport defaulting and strict TLS posture.
-- SQL log redaction.
-- Endpoint health-aware selection.
-- Naming cleanup (`StarrocksConnctor` typo).
-
-## Exit criteria for production readiness
-
-Connector is considered production-ready for staged rollout now that P0/P1 blockers are closed.
-
-For broader enterprise hardening, complete the following:
-
-1. Enforce stricter transport posture (prefer explicit `https://` endpoint configuration).
-2. Add SQL log redaction for potentially sensitive literals.
-3. Add health-aware FE endpoint rotation.
-4. Add full end-to-end fault-injection tests in a real StarRocks test environment.
-
-## Bottom line
-
-The connector is now at a safe baseline for staged production use, with transactional writes and explicit rollback/commit behavior implemented and tested. Remaining items are hardening improvements rather than release blockers.
+> Use `install` in step 1, not `package`. `package` builds the jar locally but does not put it in the local Maven repository, so the server rebuild in step 2 would pick up the older snapshot instead.

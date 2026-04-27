@@ -17,6 +17,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.slice.Slice;
 import io.trino.spi.TrinoException;
+import io.trino.spi.connector.AggregateFunction;
+import io.trino.spi.connector.AggregationApplicationResult;
 import io.trino.spi.connector.Assignment;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
@@ -34,6 +36,9 @@ import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.ConnectorViewDefinition;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
+import io.trino.spi.connector.JoinApplicationResult;
+import io.trino.spi.connector.JoinStatistics;
+import io.trino.spi.connector.JoinType;
 import io.trino.spi.connector.LimitApplicationResult;
 import io.trino.spi.connector.MaterializedViewFreshness;
 import io.trino.spi.connector.MaterializedViewNotFoundException;
@@ -67,10 +72,12 @@ import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
@@ -356,6 +363,14 @@ public class StarrocksMetadata
             Map<String, ColumnHandle> assignments)
     {
         StarrocksTableHandle starrocksHandle = (StarrocksTableHandle) handle;
+
+        if (starrocksHandle.getPushdownAggregates().isPresent()) {
+            return Optional.empty();
+        }
+        if (starrocksHandle.getJoinSqlBase().isPresent()) {
+            return Optional.empty();
+        }
+
         Set<StarrocksColumnHandle> currentColumns = new LinkedHashSet<>(starrocksHandle.getColumns());
 
         ImmutableMap<String, StarrocksColumnHandle> projectedColumns = assignments.entrySet().stream()
@@ -377,7 +392,12 @@ public class StarrocksMetadata
                 starrocksHandle.getPartitionKey(),
                 starrocksHandle.getProperties(),
                 starrocksHandle.getLimit(),
-                starrocksHandle.getSortOrder());
+                starrocksHandle.getSortOrder(),
+                starrocksHandle.getPushdownAggregates(),
+                starrocksHandle.getGroupingColumns(),
+                starrocksHandle.getHavingSql(),
+                starrocksHandle.getExpressionFilter(),
+                starrocksHandle.getJoinSqlBase());
 
         List<Assignment> assignmentList = projectedColumns.entrySet().stream()
                 .map(entry ->
@@ -426,19 +446,71 @@ public class StarrocksMetadata
     public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(ConnectorSession session, ConnectorTableHandle table, Constraint constraint)
     {
         StarrocksTableHandle handle = (StarrocksTableHandle) table;
+        int domainLimit = StarrocksSessionProperties.getTupleDomainLimit(session);
+
         TupleDomain<ColumnHandle> constraintSummary = constraint.getSummary();
+        ConnectorExpression connectorExpression = constraint.getExpression();
+
+        if (handle.getPushdownAggregates().isPresent()) {
+            // Post-aggregation filter: push down as HAVING clause.
+            if (constraintSummary.isNone() || constraintSummary.isAll()) {
+                return Optional.empty();
+            }
+            String havingClause = client.getFeClient().buildPredicate(constraintSummary, domainLimit);
+            if (havingClause == null || havingClause.isBlank()) {
+                return Optional.empty();
+            }
+            String newHaving = handle.getHavingSql()
+                    .map(existing -> existing + " AND " + havingClause)
+                    .orElse(havingClause);
+            StarrocksTableHandle newHandle = new StarrocksTableHandle(
+                    handle.getSchemaTableName(),
+                    handle.getColumns(),
+                    handle.getConstraint(),
+                    handle.getComment(),
+                    handle.getPartitionKey(),
+                    handle.getProperties(),
+                    handle.getLimit(),
+                    handle.getSortOrder(),
+                    handle.getPushdownAggregates(),
+                    handle.getGroupingColumns(),
+                    Optional.of(newHaving),
+                    handle.getExpressionFilter(),
+                    handle.getJoinSqlBase());
+            return Optional.of(new ConstraintApplicationResult<>(newHandle, TupleDomain.all(), connectorExpression, false));
+        }
 
         if (constraintSummary.isNone()) {
             return Optional.empty();
         }
 
         TupleDomain<ColumnHandle> oldDomain = handle.getConstraint();
+        TupleDomain<ColumnHandle> newDomain = oldDomain.intersect(constraintSummary);
 
-        if (oldDomain.contains(constraintSummary) && !oldDomain.isAll()) {
+        // Try to translate the ConnectorExpression (LIKE, OR across columns, IS NULL, etc.) to SQL.
+        boolean isExprTrivial = (connectorExpression instanceof Constant c && Boolean.TRUE.equals(c.getValue()));
+        Optional<String> translatedExpr = isExprTrivial
+                ? Optional.empty()
+                : client.getFeClient().translateConnectorExpression(connectorExpression, constraint.getAssignments());
+
+        boolean domainChanged = !newDomain.equals(oldDomain);
+        boolean exprIsNew = translatedExpr.isPresent();
+
+        if (!domainChanged && !exprIsNew) {
             return Optional.empty();
         }
 
-        TupleDomain<ColumnHandle> newDomain = oldDomain.intersect(constraintSummary);
+        Optional<String> newExprFilter;
+        if (translatedExpr.isPresent()) {
+            newExprFilter = handle.getExpressionFilter()
+                    .map(existing -> "(" + existing + ") AND (" + translatedExpr.get() + ")")
+                    .or(() -> translatedExpr);
+        }
+        else {
+            newExprFilter = handle.getExpressionFilter();
+        }
+
+        ConnectorExpression remainingExpr = translatedExpr.isPresent() ? Constant.TRUE : connectorExpression;
 
         StarrocksTableHandle newHandle = new StarrocksTableHandle(
                 handle.getSchemaTableName(),
@@ -448,9 +520,14 @@ public class StarrocksMetadata
                 handle.getPartitionKey(),
                 handle.getProperties(),
                 handle.getLimit(),
-                handle.getSortOrder());
+                handle.getSortOrder(),
+                handle.getPushdownAggregates(),
+                handle.getGroupingColumns(),
+                handle.getHavingSql(),
+                newExprFilter,
+                handle.getJoinSqlBase());
 
-        return Optional.of(new ConstraintApplicationResult<>(newHandle, TupleDomain.all(), constraint.getExpression(), false));
+        return Optional.of(new ConstraintApplicationResult<>(newHandle, TupleDomain.all(), remainingExpr, false));
     }
 
     @Override
@@ -470,7 +547,12 @@ public class StarrocksMetadata
                 handle.getPartitionKey(),
                 handle.getProperties(),
                 OptionalLong.of(limit),
-                handle.getSortOrder());
+                handle.getSortOrder(),
+                handle.getPushdownAggregates(),
+                handle.getGroupingColumns(),
+                handle.getHavingSql(),
+                handle.getExpressionFilter(),
+                handle.getJoinSqlBase());
 
         return Optional.of(new LimitApplicationResult<>(updatedHandle, false, false));
     }
@@ -488,6 +570,10 @@ public class StarrocksMetadata
         }
 
         StarrocksTableHandle handle = (StarrocksTableHandle) table;
+
+        if (handle.getPushdownAggregates().isPresent()) {
+            return Optional.empty();
+        }
 
         List<SortItem> normalizedSortItems = sortItems.stream()
                 .map(sortItem -> {
@@ -527,9 +613,305 @@ public class StarrocksMetadata
                 handle.getPartitionKey(),
                 handle.getProperties(),
                 OptionalLong.of(pushedLimit),
-                Optional.of(normalizedSortItems));
+                Optional.of(normalizedSortItems),
+                handle.getPushdownAggregates(),
+                handle.getGroupingColumns(),
+                handle.getHavingSql(),
+                handle.getExpressionFilter(),
+                handle.getJoinSqlBase());
 
         return Optional.of(new TopNApplicationResult<>(updatedHandle, false, false));
+    }
+
+    @Override
+    public Optional<AggregationApplicationResult<ConnectorTableHandle>> applyAggregation(
+            ConnectorSession session,
+            ConnectorTableHandle handle,
+            List<AggregateFunction> aggregates,
+            Map<String, ColumnHandle> assignments,
+            List<List<ColumnHandle>> groupingSets)
+    {
+        if (groupingSets.size() != 1) {
+            return Optional.empty();
+        }
+
+        StarrocksTableHandle tableHandle = (StarrocksTableHandle) handle;
+        if (tableHandle.getPushdownAggregates().isPresent()) {
+            return Optional.empty();
+        }
+        if (tableHandle.getJoinSqlBase().isPresent()) {
+            return Optional.empty();
+        }
+
+        List<ColumnHandle> groupingColumnHandles = groupingSets.get(0);
+
+        // Empty aggregates with no grouping columns has no meaning to push down.
+        if (aggregates.isEmpty() && groupingColumnHandles.isEmpty()) {
+            return Optional.empty();
+        }
+
+        Set<String> supportedFunctions = Set.of("count", "sum", "min", "max", "avg");
+
+        List<StarrocksAggregateFunction> starrocksAggregates = new ArrayList<>();
+        for (int i = 0; i < aggregates.size(); i++) {
+            AggregateFunction aggregate = aggregates.get(i);
+
+            if (aggregate.getFilter().isPresent()) {
+                return Optional.empty();
+            }
+            if (!aggregate.getSortItems().isEmpty()) {
+                return Optional.empty();
+            }
+
+            String functionName = aggregate.getFunctionName().toLowerCase(Locale.ROOT);
+            if (!supportedFunctions.contains(functionName)) {
+                return Optional.empty();
+            }
+
+            Optional<String> columnName;
+            List<ConnectorExpression> arguments = aggregate.getArguments();
+            if (arguments.isEmpty()) {
+                columnName = Optional.empty();
+            }
+            else if (arguments.size() == 1 && arguments.get(0) instanceof Variable variable) {
+                ColumnHandle colHandle = assignments.get(variable.getName());
+                if (!(colHandle instanceof StarrocksColumnHandle srCol)) {
+                    return Optional.empty();
+                }
+                columnName = Optional.of(srCol.getColumnName());
+            }
+            else {
+                return Optional.empty();
+            }
+
+            String outputAlias = "_agg_" + i;
+            String starrocksOutputType = toStarrocksColumnType(aggregate.getOutputType());
+            starrocksAggregates.add(new StarrocksAggregateFunction(
+                    functionName,
+                    columnName,
+                    aggregate.isDistinct(),
+                    outputAlias,
+                    starrocksOutputType));
+        }
+
+        List<String> groupingColumnNames = groupingColumnHandles.stream()
+                .map(col -> ((StarrocksColumnHandle) col).getColumnName())
+                .collect(toImmutableList());
+
+        StarrocksTableHandle newHandle = new StarrocksTableHandle(
+                tableHandle.getSchemaTableName(),
+                tableHandle.getColumns(),
+                tableHandle.getConstraint(),
+                tableHandle.getComment(),
+                tableHandle.getPartitionKey(),
+                tableHandle.getProperties(),
+                tableHandle.getLimit(),
+                tableHandle.getSortOrder(),
+                Optional.of(starrocksAggregates),
+                Optional.of(groupingColumnNames));
+
+        ImmutableList.Builder<ConnectorExpression> projectionsBuilder = ImmutableList.builder();
+        ImmutableList.Builder<Assignment> assignmentsBuilder = ImmutableList.builder();
+        for (int i = 0; i < aggregates.size(); i++) {
+            AggregateFunction aggregate = aggregates.get(i);
+            StarrocksAggregateFunction agg = starrocksAggregates.get(i);
+            StarrocksColumnHandle outputHandle = buildAggregateOutputHandle(agg.getOutputColumnName(), aggregate.getOutputType(), i);
+            projectionsBuilder.add(new Variable(agg.getOutputColumnName(), aggregate.getOutputType()));
+            assignmentsBuilder.add(new Assignment(agg.getOutputColumnName(), outputHandle, aggregate.getOutputType()));
+        }
+
+        ImmutableMap.Builder<ColumnHandle, ColumnHandle> groupingMappingBuilder = ImmutableMap.builder();
+        for (ColumnHandle col : groupingColumnHandles) {
+            groupingMappingBuilder.put(col, col);
+        }
+
+        return Optional.of(new AggregationApplicationResult<>(
+                newHandle,
+                projectionsBuilder.build(),
+                assignmentsBuilder.build(),
+                groupingMappingBuilder.buildOrThrow(),
+                false));
+    }
+
+    @Override
+    public Optional<JoinApplicationResult<ConnectorTableHandle>> applyJoin(
+            ConnectorSession session,
+            JoinType joinType,
+            ConnectorTableHandle left,
+            ConnectorTableHandle right,
+            ConnectorExpression joinCondition,
+            Map<String, ColumnHandle> leftAssignments,
+            Map<String, ColumnHandle> rightAssignments,
+            JoinStatistics statistics)
+    {
+        if (!(left instanceof StarrocksTableHandle leftHandle) || !(right instanceof StarrocksTableHandle rightHandle)) {
+            return Optional.empty();
+        }
+        if (leftHandle.getPushdownAggregates().isPresent() || rightHandle.getPushdownAggregates().isPresent()) {
+            return Optional.empty();
+        }
+        if (leftHandle.getJoinSqlBase().isPresent() || rightHandle.getJoinSqlBase().isPresent()) {
+            return Optional.empty();
+        }
+
+        int domainLimit = StarrocksSessionProperties.getTupleDomainLimit(session);
+
+        Optional<String> conditionSql = client.getFeClient().translateJoinCondition(joinCondition, leftAssignments, rightAssignments);
+        if (conditionSql.isEmpty()) {
+            return Optional.empty();
+        }
+
+        List<StarrocksColumnHandle> leftCols = leftHandle.getColumns();
+        List<StarrocksColumnHandle> rightCols = rightHandle.getColumns();
+
+        ImmutableList.Builder<StarrocksColumnHandle> newColumnsBuilder = ImmutableList.builder();
+        ImmutableMap.Builder<ColumnHandle, ColumnHandle> leftMapping = ImmutableMap.builder();
+        ImmutableMap.Builder<ColumnHandle, ColumnHandle> rightMapping = ImmutableMap.builder();
+
+        for (int i = 0; i < leftCols.size(); i++) {
+            StarrocksColumnHandle col = leftCols.get(i);
+            StarrocksColumnHandle newCol = new StarrocksColumnHandle(
+                    "_lc_" + i, i, col.getType(), col.getColumnType(),
+                    col.isNullable(), col.getExtra(), col.getComment(), col.getColumnSize(), col.getDecimalDigits());
+            newColumnsBuilder.add(newCol);
+            leftMapping.put(col, newCol);
+        }
+        for (int j = 0; j < rightCols.size(); j++) {
+            StarrocksColumnHandle col = rightCols.get(j);
+            StarrocksColumnHandle newCol = new StarrocksColumnHandle(
+                    "_rc_" + j, leftCols.size() + j, col.getType(), col.getColumnType(),
+                    col.isNullable(), col.getExtra(), col.getComment(), col.getColumnSize(), col.getDecimalDigits());
+            newColumnsBuilder.add(newCol);
+            rightMapping.put(col, newCol);
+        }
+
+        String leftSchema = leftHandle.getSchemaTableName().getSchemaName();
+        String leftTable = leftHandle.getSchemaTableName().getTableName();
+        String rightSchema = rightHandle.getSchemaTableName().getSchemaName();
+        String rightTable = rightHandle.getSchemaTableName().getTableName();
+
+        StringBuilder selectParts = new StringBuilder();
+        for (int i = 0; i < leftCols.size(); i++) {
+            if (selectParts.length() > 0) {
+                selectParts.append(", ");
+            }
+            selectParts.append("_l.`").append(leftCols.get(i).getColumnName()).append("` AS `_lc_").append(i).append("`");
+        }
+        for (int j = 0; j < rightCols.size(); j++) {
+            if (selectParts.length() > 0) {
+                selectParts.append(", ");
+            }
+            selectParts.append("_r.`").append(rightCols.get(j).getColumnName()).append("` AS `_rc_").append(j).append("`");
+        }
+
+        String joinTypeStr = switch (joinType) {
+            case INNER -> "INNER JOIN";
+            case LEFT_OUTER -> "LEFT OUTER JOIN";
+            case RIGHT_OUTER -> "RIGHT OUTER JOIN";
+            case FULL_OUTER -> "FULL OUTER JOIN";
+        };
+
+        // Per-side predicates and expression filters go inside subqueries, not in a flat outer
+        // WHERE, because an outer WHERE on a null-extended side would convert OUTER to INNER.
+        String leftSubquery = buildJoinSideSubquery(
+                leftSchema, leftTable, leftHandle.getConstraint(), leftHandle.getExpressionFilter(), domainLimit);
+        String rightSubquery = buildJoinSideSubquery(
+                rightSchema, rightTable, rightHandle.getConstraint(), rightHandle.getExpressionFilter(), domainLimit);
+
+        StringBuilder innerSql = new StringBuilder("SELECT ");
+        innerSql.append(selectParts);
+        innerSql.append(" FROM (").append(leftSubquery).append(") AS _l");
+        innerSql.append(" ").append(joinTypeStr);
+        innerSql.append(" (").append(rightSubquery).append(") AS _r");
+        innerSql.append(" ON ").append(conditionSql.get());
+
+        StarrocksTableHandle newHandle = new StarrocksTableHandle(
+                leftHandle.getSchemaTableName(),
+                newColumnsBuilder.build(),
+                TupleDomain.all(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                OptionalLong.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.empty(),
+                Optional.of(innerSql.toString()));
+
+        return Optional.of(new JoinApplicationResult<>(
+                newHandle,
+                leftMapping.buildOrThrow(),
+                rightMapping.buildOrThrow(),
+                false));
+    }
+
+    private String buildJoinSideSubquery(
+            String schema,
+            String table,
+            TupleDomain<ColumnHandle> constraint,
+            Optional<String> expressionFilter,
+            int domainLimit)
+    {
+        StringBuilder sql = new StringBuilder("SELECT * FROM `")
+                .append(schema).append("`.`").append(table).append("`");
+        List<String> whereParts = new ArrayList<>();
+        if (!constraint.isNone() && !constraint.isAll()) {
+            String pred = client.getFeClient().buildPredicate(constraint, domainLimit);
+            if (pred != null && !pred.isBlank()) {
+                whereParts.add(pred);
+            }
+        }
+        expressionFilter.ifPresent(whereParts::add);
+        if (!whereParts.isEmpty()) {
+            sql.append(" WHERE ").append(String.join(" AND ", whereParts));
+        }
+        return sql.toString();
+    }
+
+    private StarrocksColumnHandle buildAggregateOutputHandle(String alias, Type outputType, int ordinal)
+    {
+        String srType = toStarrocksColumnType(outputType);
+        return new StarrocksColumnHandle(alias, ordinal, srType, srType, true, "", "", 0, 0);
+    }
+
+    private String toStarrocksColumnType(Type type)
+    {
+        if (type instanceof BigintType) {
+            return "bigint";
+        }
+        if (type instanceof DoubleType) {
+            return "double";
+        }
+        if (type instanceof DecimalType dt) {
+            return "decimal(" + dt.getPrecision() + "," + dt.getScale() + ")";
+        }
+        if (type instanceof IntegerType) {
+            return "int";
+        }
+        if (type instanceof SmallintType) {
+            return "smallint";
+        }
+        if (type instanceof TinyintType) {
+            return "tinyint";
+        }
+        if (type instanceof RealType) {
+            return "float";
+        }
+        if (type instanceof VarcharType) {
+            return "varchar";
+        }
+        if (type instanceof DateType) {
+            return "date";
+        }
+        if (type instanceof TimestampType) {
+            return "datetime";
+        }
+        if (type instanceof BooleanType) {
+            return "boolean";
+        }
+        return "varchar";
     }
 
     @Override

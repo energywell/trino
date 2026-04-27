@@ -33,6 +33,10 @@ import io.trino.spi.connector.MaterializedViewFreshness;
 import io.trino.spi.connector.SaveMode;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.SortItem;
+import io.trino.spi.expression.Call;
+import io.trino.spi.expression.ConnectorExpression;
+import io.trino.spi.expression.Constant;
+import io.trino.spi.expression.Variable;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.EquatableValueSet;
 import io.trino.spi.predicate.Range;
@@ -95,6 +99,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -309,7 +314,7 @@ public class StarrocksFEClient
 
         if (sortOrder.isPresent() && !sortOrder.get().isEmpty()) {
             String orderBy = sortOrder.get().stream()
-                    .map(item -> "`" + item.getName() + "` " + item.getSortOrder())
+                    .map(item -> "`" + item.getName() + "` " + (item.getSortOrder().isAscending() ? "ASC" : "DESC"))
                     .collect(Collectors.joining(", "));
             sql += " ORDER BY " + orderBy;
         }
@@ -321,10 +326,15 @@ public class StarrocksFEClient
         return sql;
     }
 
-    private String buildPredicate(TupleDomain<ColumnHandle> constraint, int domainLimit)
+    String buildPredicate(TupleDomain<ColumnHandle> constraint, int domainLimit)
+    {
+        return buildPredicate(constraint, domainLimit, null);
+    }
+
+    // tableAlias, when non-null, prefixes each column reference (e.g. "_l" → _l.`col`).
+    String buildPredicate(TupleDomain<ColumnHandle> constraint, int domainLimit, String tableAlias)
     {
         if (constraint.isNone() || constraint.isAll()) {
-            // no predicate
             return null;
         }
 
@@ -332,24 +342,26 @@ public class StarrocksFEClient
 
         for (Map.Entry<ColumnHandle, Domain> entry : constraint.getDomains().get().entrySet()) {
             StarrocksColumnHandle columnHandle = (StarrocksColumnHandle) entry.getKey();
-//            Domain domain = entry.getValue();
             Domain domain = entry.getValue().simplify(domainLimit);
-            String columnName = columnHandle.getColumnName();
+            String rawName = columnHandle.getColumnName().replace("`", "``");
+            String columnExpr = tableAlias != null
+                    ? tableAlias + ".`" + rawName + "`"
+                    : "`" + rawName + "`";
 
             if (domain.isOnlyNull()) {
-                conjuncts.add(String.format("`%s` IS NULL", columnName));
+                conjuncts.add(String.format("%s IS NULL", columnExpr));
             }
             else if (domain.isNullAllowed()) {
-                Optional<String> predicate = toPredicate(columnName, domain.getValues(), domain);
+                Optional<String> predicate = toPredicate(columnExpr, domain.getValues(), domain);
                 if (predicate.isPresent()) {
-                    conjuncts.add(String.format("(`%s` IS NULL OR %s)", columnName, predicate.get()));
+                    conjuncts.add(String.format("(%s IS NULL OR %s)", columnExpr, predicate.get()));
                 }
                 else {
-                    conjuncts.add(String.format("`%s` IS NULL", columnName));
+                    conjuncts.add(String.format("%s IS NULL", columnExpr));
                 }
             }
             else {
-                Optional<String> predicate = toPredicate(columnName, domain.getValues(), domain);
+                Optional<String> predicate = toPredicate(columnExpr, domain.getValues(), domain);
                 predicate.ifPresent(conjuncts::add);
             }
         }
@@ -357,44 +369,44 @@ public class StarrocksFEClient
         return String.join(" AND ", conjuncts);
     }
 
-    private Optional<String> toPredicate(String columnName, ValueSet valueSet, Domain domain)
+    private Optional<String> toPredicate(String columnExpr, ValueSet valueSet, Domain domain)
     {
         if (valueSet instanceof EquatableValueSet) {
             List<String> values = ((EquatableValueSet) valueSet).getValues().stream()
                     .map(value -> formatLiteral(value, valueSet.getType()))
                     .collect(Collectors.toList());
             if (values.size() == 1) {
-                return Optional.of(String.format("`%s` = %s", columnName, values.get(0)));
+                return Optional.of(String.format("%s = %s", columnExpr, values.get(0)));
             }
-            return Optional.of(String.format("`%s` IN (%s)", columnName, String.join(", ", values)));
+            return Optional.of(String.format("%s IN (%s)", columnExpr, String.join(", ", values)));
         }
         else if (valueSet instanceof SortedRangeSet) {
             List<Range> ranges = ((SortedRangeSet) valueSet).getOrderedRanges();
             List<String> rangeConjuncts = new ArrayList<>();
             if (valueSet.isAll() && !domain.isNullAllowed()) {
-                rangeConjuncts.add(String.format("`%s` IS NOT NULL", columnName));
+                rangeConjuncts.add(String.format("%s IS NOT NULL", columnExpr));
             }
             if (ranges.stream().allMatch(Range::isSingleValue) && ranges.size() > 1) {
                 List<String> values = ranges.stream()
                         .map(value -> formatLiteral(value.getSingleValue(), value.getType()))
                         .collect(toImmutableList());
-                String predicate = String.format("`%s` IN (%s)", columnName, String.join(", ", values));
+                String predicate = String.format("%s IN (%s)", columnExpr, String.join(", ", values));
                 rangeConjuncts.add(predicate);
             }
             else {
                 for (Range range : ranges) {
                     if (range.isSingleValue()) {
-                        rangeConjuncts.add(String.format("`%s` = %s", columnName, formatLiteral(range.getSingleValue(), range.getType())));
+                        rangeConjuncts.add(String.format("%s = %s", columnExpr, formatLiteral(range.getSingleValue(), range.getType())));
                     }
                     else {
                         List<String> rangeElements = new ArrayList<>();
                         if (!range.isLowUnbounded()) {
                             String operator = range.isLowInclusive() ? ">=" : ">";
-                            rangeElements.add(String.format("`%s` %s %s", columnName, operator, formatLiteral(range.getLowBoundedValue(), range.getType())));
+                            rangeElements.add(String.format("%s %s %s", columnExpr, operator, formatLiteral(range.getLowBoundedValue(), range.getType())));
                         }
                         if (!range.isHighUnbounded()) {
                             String operator = range.isHighInclusive() ? "<=" : "<";
-                            rangeElements.add(String.format("`%s` %s %s", columnName, operator, formatLiteral(range.getHighBoundedValue(), range.getType())));
+                            rangeElements.add(String.format("%s %s %s", columnExpr, operator, formatLiteral(range.getHighBoundedValue(), range.getType())));
                         }
                         if (!rangeElements.isEmpty()) {
                             rangeConjuncts.add(String.join(" AND ", rangeElements));
@@ -410,6 +422,200 @@ public class StarrocksFEClient
         }
 
         throw new IllegalArgumentException("Unsupported ValueSet type: " + valueSet.getClass().getSimpleName());
+    }
+
+    Optional<String> translateConnectorExpression(ConnectorExpression expression, Map<String, ColumnHandle> assignments)
+    {
+        return translateExpression(expression, variable -> {
+            ColumnHandle handle = assignments.get(variable.getName());
+            if (handle instanceof StarrocksColumnHandle col) {
+                return Optional.of("`" + col.getColumnName().replace("`", "``") + "`");
+            }
+            return Optional.empty();
+        });
+    }
+
+    Optional<String> translateJoinCondition(ConnectorExpression condition, Map<String, ColumnHandle> leftAssignments, Map<String, ColumnHandle> rightAssignments)
+    {
+        return translateExpression(condition, variable -> {
+            String name = variable.getName();
+            ColumnHandle leftCol = leftAssignments.get(name);
+            if (leftCol instanceof StarrocksColumnHandle col) {
+                return Optional.of("_l.`" + col.getColumnName().replace("`", "``") + "`");
+            }
+            ColumnHandle rightCol = rightAssignments.get(name);
+            if (rightCol instanceof StarrocksColumnHandle col) {
+                return Optional.of("_r.`" + col.getColumnName().replace("`", "``") + "`");
+            }
+            return Optional.empty();
+        });
+    }
+
+    private Optional<String> translateExpression(ConnectorExpression expression, Function<Variable, Optional<String>> resolver)
+    {
+        if (expression instanceof Constant constant) {
+            if (constant.getValue() == null) {
+                return Optional.of("NULL");
+            }
+            try {
+                return Optional.of(formatLiteral(constant.getValue(), constant.getType()));
+            }
+            catch (Exception e) {
+                return Optional.empty();
+            }
+        }
+        if (expression instanceof Variable variable) {
+            return resolver.apply(variable);
+        }
+        if (expression instanceof Call call) {
+            String funcName = call.getFunctionName().getName();
+            List<ConnectorExpression> args = call.getArguments();
+            if (funcName.equals("$and") && args.size() == 2) {
+                Optional<String> l = translateExpression(args.get(0), resolver);
+                Optional<String> r = translateExpression(args.get(1), resolver);
+                if (l.isPresent() && r.isPresent()) {
+                    return Optional.of("(" + l.get() + " AND " + r.get() + ")");
+                }
+            }
+            else if (funcName.equals("$or") && args.size() == 2) {
+                Optional<String> l = translateExpression(args.get(0), resolver);
+                Optional<String> r = translateExpression(args.get(1), resolver);
+                if (l.isPresent() && r.isPresent()) {
+                    return Optional.of("(" + l.get() + " OR " + r.get() + ")");
+                }
+            }
+            else if (funcName.equals("$not") && args.size() == 1) {
+                Optional<String> operand = translateExpression(args.get(0), resolver);
+                if (operand.isPresent()) {
+                    return Optional.of("NOT (" + operand.get() + ")");
+                }
+            }
+            else if (funcName.equals("$is_null") && args.size() == 1) {
+                Optional<String> operand = translateExpression(args.get(0), resolver);
+                if (operand.isPresent()) {
+                    return Optional.of("(" + operand.get() + " IS NULL)");
+                }
+            }
+            else if (args.size() == 2) {
+                String op = switch (funcName) {
+                    case "$equal" -> "=";
+                    case "$not_equal" -> "<>";
+                    case "$less_than" -> "<";
+                    case "$less_than_or_equal" -> "<=";
+                    case "$greater_than" -> ">";
+                    case "$greater_than_or_equal" -> ">=";
+                    case "$like" -> "LIKE";
+                    default -> null;
+                };
+                if (op != null) {
+                    Optional<String> l = translateExpression(args.get(0), resolver);
+                    Optional<String> r = translateExpression(args.get(1), resolver);
+                    if (l.isPresent() && r.isPresent()) {
+                        return Optional.of("(" + l.get() + " " + op + " " + r.get() + ")");
+                    }
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    public StarrocksAggregateSplit buildJoinSplit(StarrocksTableHandle handle, int domainLimit)
+    {
+        String innerSql = handle.getJoinSqlBase().get();
+
+        List<String> outerWhere = new ArrayList<>();
+        TupleDomain<ColumnHandle> constraint = handle.getConstraint();
+        if (!constraint.isNone() && !constraint.isAll()) {
+            String pred = buildPredicate(constraint, domainLimit);
+            if (pred != null && !pred.isBlank()) {
+                outerWhere.add(pred);
+            }
+        }
+        handle.getExpressionFilter().ifPresent(outerWhere::add);
+
+        StringBuilder sql = new StringBuilder("SELECT * FROM (");
+        sql.append(innerSql);
+        sql.append(") AS _j");
+
+        if (!outerWhere.isEmpty()) {
+            sql.append(" WHERE ").append(String.join(" AND ", outerWhere));
+        }
+
+        if (handle.getSortOrder().isPresent() && !handle.getSortOrder().get().isEmpty()) {
+            String orderBy = handle.getSortOrder().get().stream()
+                    .map(item -> "`" + item.getName() + "` " + (item.getSortOrder().isAscending() ? "ASC" : "DESC"))
+                    .collect(Collectors.joining(", "));
+            sql.append(" ORDER BY ").append(orderBy);
+        }
+
+        handle.getLimit().ifPresent(limit -> sql.append(" LIMIT ").append(limit));
+
+        return new StarrocksAggregateSplit(sql.toString());
+    }
+
+    public Connection openConnection(ConnectorSession session)
+            throws SQLException
+    {
+        return dbClient.openConnection(session);
+    }
+
+    public StarrocksAggregateSplit buildAggregateSplit(StarrocksTableHandle handle, int domainLimit)
+    {
+        List<StarrocksAggregateFunction> aggregates = handle.getPushdownAggregates().get();
+        List<String> groupingCols = handle.getGroupingColumns().get();
+        String schemaName = handle.getSchemaTableName().getSchemaName();
+        String tableName = handle.getSchemaTableName().getTableName();
+
+        List<String> selectParts = new ArrayList<>();
+        for (String col : groupingCols) {
+            selectParts.add("`" + col + "`");
+        }
+        for (StarrocksAggregateFunction agg : aggregates) {
+            selectParts.add(buildAggregateExpr(agg) + " AS `" + agg.getOutputColumnName() + "`");
+        }
+
+        if (selectParts.isEmpty()) {
+            selectParts.add("1");
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT ");
+        sql.append(String.join(", ", selectParts));
+        sql.append(" FROM `").append(schemaName).append("`.`").append(tableName).append("`");
+
+        TupleDomain<ColumnHandle> constraint = handle.getConstraint();
+        List<String> whereFragments = new ArrayList<>();
+        if (!constraint.isNone() && !constraint.isAll()) {
+            String pred = buildPredicate(constraint, domainLimit);
+            if (pred != null && !pred.isBlank()) {
+                whereFragments.add(pred);
+            }
+        }
+        handle.getExpressionFilter().ifPresent(whereFragments::add);
+        if (!whereFragments.isEmpty()) {
+            sql.append(" WHERE ").append(String.join(" AND ", whereFragments));
+        }
+
+        if (!groupingCols.isEmpty()) {
+            sql.append(" GROUP BY ");
+            sql.append(groupingCols.stream()
+                    .map(c -> "`" + c + "`")
+                    .collect(Collectors.joining(", ")));
+        }
+
+        handle.getHavingSql().ifPresent(having -> sql.append(" HAVING ").append(having));
+
+        handle.getLimit().ifPresent(limit -> sql.append(" LIMIT ").append(limit));
+
+        return new StarrocksAggregateSplit(sql.toString());
+    }
+
+    private String buildAggregateExpr(StarrocksAggregateFunction agg)
+    {
+        String distinct = agg.isDistinct() ? "DISTINCT " : "";
+        String colExpr = agg.getColumnName()
+                .map(col -> distinct + "`" + col + "`")
+                .orElse("*");
+        return agg.getFunctionName().toUpperCase(Locale.ROOT) + "(" + colExpr + ")";
     }
 
     public List<String> getSchemaNames(ConnectorSession session)
@@ -899,17 +1105,18 @@ public class StarrocksFEClient
     public StarrocksQueryInfo getQueryInfo(StarrocksTableHandle tableHandle, TupleDomain<ColumnHandle> predicate, int domainLimit)
             throws IOException
     {
-        // _query_plan endpoint may reject ORDER BY/LIMIT; keep those in Trino planning state,
-        // but generate filter-prune-scan SQL for query-plan retrieval.
+        // /_query_plan only accepts filter-prune-scan SQL (SELECT + WHERE). LIMIT and ORDER BY
+        // are rejected by the FE. The per-split row cap is enforced by StarrocksPageSource via
+        // pageSourceLimit; the global LIMIT and TopN sort are handled by Trino's own operators.
         String sql = genSQL(
                 Optional.ofNullable(
                 tableHandle.getColumns().stream().map(StarrocksColumnHandle::getColumnName).collect(toImmutableList())),
                 tableHandle.getSchemaTableName().getSchemaName(),
                 tableHandle.getSchemaTableName().getTableName(),
                 predicate,
-            domainLimit,
-            OptionalLong.empty(),
-            Optional.empty());
+                domainLimit,
+                OptionalLong.empty(),
+                Optional.empty());
         LOG.debug("Generated SQL: {}", sql);
         StarrocksQueryPlan plan = getQueryPlan(sql, tableHandle);
         Map<String, Set<Long>> beXTablets = transferQueryPlanToBeXTablet(plan);

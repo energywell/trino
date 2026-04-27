@@ -15,6 +15,7 @@
 package io.trino.plugin.starrocks;
 
 import com.google.inject.Inject;
+import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ConnectorPageSource;
 import io.trino.spi.connector.ConnectorPageSourceProvider;
@@ -24,9 +25,13 @@ import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTransactionHandle;
 import io.trino.spi.connector.DynamicFilter;
 
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.util.List;
 import java.util.OptionalLong;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
 import static java.util.Objects.requireNonNull;
 
 public class StarrocksPageSourceProvider
@@ -51,6 +56,30 @@ public class StarrocksPageSourceProvider
             List<ColumnHandle> columns,
             DynamicFilter dynamicFilter)
     {
+        if (split instanceof StarrocksAggregateSplit aggregateSplit) {
+            List<StarrocksColumnHandle> srColumns = columns.stream()
+                    .map(StarrocksColumnHandle.class::cast)
+                    .collect(toImmutableList());
+            Connection connection;
+            try {
+                connection = client.getFeClient().openConnection(session);
+            }
+            catch (SQLException e) {
+                throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to open JDBC connection for aggregate query: " + e.getMessage(), e);
+            }
+            try {
+                return new StarrocksJdbcPageSource(connection, aggregateSplit.getAggregateQuery(), srColumns, typeMapper);
+            }
+            catch (RuntimeException e) {
+                try {
+                    connection.close();
+                }
+                catch (SQLException ignored) {
+                }
+                throw e;
+            }
+        }
+
         StarrocksSplit starrocksSplit = (StarrocksSplit) split;
         StarrocksTableHandle table = (StarrocksTableHandle) tableHandle;
         StarrocksBeReader beReader = new StarrocksBeReader(client.getConfig(), starrocksSplit.getBeNode(), columns, table.getSchemaTableName());
