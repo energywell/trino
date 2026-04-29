@@ -14,6 +14,7 @@
 package io.trino.plugin.starrocks;
 
 import com.google.inject.Module;
+import io.airlift.json.JsonCodec;
 import io.airlift.slice.Slice;
 import io.trino.plugin.tpch.DecimalTypeMapping;
 import io.trino.plugin.tpch.TpchMetadata;
@@ -21,6 +22,8 @@ import io.trino.plugin.tpch.TpchRecordSet;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.RecordCursor;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.Domain;
+import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.type.CharType;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.TimestampType;
@@ -50,6 +53,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -60,21 +64,28 @@ import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
+import static io.airlift.json.JsonCodec.jsonCodec;
+import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.DateType.DATE;
+import static io.trino.spi.type.Decimals.encodeShortScaledValue;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
 import static io.trino.spi.type.SmallintType.SMALLINT;
+import static io.trino.spi.type.StandardTypes.JSON;
+import static io.trino.spi.type.Timestamps.MICROSECONDS_PER_SECOND;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
+import static java.lang.Float.floatToRawIntBits;
 import static java.lang.Math.toIntExact;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 final class TestingStarRocksEnvironment
 {
+    private static final JsonCodec<Object> JSON_CODEC = jsonCodec(Object.class);
     private static final String TPCH_SCHEMA = TpchMetadata.TINY_SCHEMA_NAME;
     private static final double TPCH_SCALE_FACTOR = TpchMetadata.TINY_SCALE_FACTOR;
 
@@ -240,7 +251,7 @@ final class TestingStarRocksEnvironment
 
         private StarRocksRemoteTable toRemoteTable()
         {
-            return new StarRocksRemoteTable(schemaTableName, remoteSchemaName, remoteTableName, relationType, columns);
+            return new StarRocksRemoteTable(schemaTableName, Optional.empty(), remoteSchemaName, remoteTableName, relationType, columns);
         }
     }
 
@@ -304,8 +315,184 @@ final class TestingStarRocksEnvironment
             lastRequest.set(new Request(tableHandle, columns));
 
             TestingTable table = tables.get(tableHandle.toSchemaTableName());
-            List<Map<String, Object>> rows = table == null ? List.of() : table.rows();
+            List<Map<String, Object>> rows = table == null ? List.of() : applyTableHandle(tableHandle, table.rows());
             return createResult(table, columns, rows);
+        }
+
+        private static List<Map<String, Object>> applyTableHandle(StarRocksTableHandle tableHandle, List<Map<String, Object>> rows)
+        {
+            List<Map<String, Object>> filteredRows = applyConstraint(tableHandle.constraint(), rows);
+            List<Map<String, Object>> projectedRows = tableHandle.aggregation()
+                    .map(aggregation -> applyAggregation(aggregation, filteredRows))
+                    .orElse(filteredRows);
+            List<Map<String, Object>> sortedRows = applySort(tableHandle.sortOrder(), projectedRows);
+            if (tableHandle.limit().isEmpty()) {
+                return sortedRows;
+            }
+            return sortedRows.stream()
+                    .limit(tableHandle.limit().getAsLong())
+                    .toList();
+        }
+
+        private static List<Map<String, Object>> applyConstraint(TupleDomain<StarRocksColumnHandle> constraint, List<Map<String, Object>> rows)
+        {
+            if (constraint.isNone()) {
+                return List.of();
+            }
+            if (constraint.isAll() || constraint.getDomains().isEmpty()) {
+                return rows;
+            }
+
+            return rows.stream()
+                    .filter(row -> matchesConstraint(row, constraint.getDomains().orElseThrow()))
+                    .toList();
+        }
+
+        private static boolean matchesConstraint(Map<String, Object> row, Map<StarRocksColumnHandle, Domain> domains)
+        {
+            for (Map.Entry<StarRocksColumnHandle, Domain> entry : domains.entrySet()) {
+                StarRocksColumnHandle column = entry.getKey();
+                if (!entry.getValue().includesNullableValue(toDomainValue(row.get(column.columnName()), column.columnType()))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static List<Map<String, Object>> applyAggregation(StarRocksAggregation aggregation, List<Map<String, Object>> rows)
+        {
+            Map<List<Object>, List<Map<String, Object>>> groups = rows.stream()
+                    .collect(Collectors.groupingBy(row -> aggregation.groupingColumns().stream()
+                                    .map(column -> row.get(column.columnName()))
+                                    .toList(),
+                            LinkedHashMap::new,
+                            Collectors.toList()));
+            if (groups.isEmpty() && aggregation.groupingColumns().isEmpty()) {
+                groups = Map.of(List.of(), List.of());
+            }
+
+            List<Map<String, Object>> results = new ArrayList<>(groups.size());
+            for (Map.Entry<List<Object>, List<Map<String, Object>>> group : groups.entrySet()) {
+                LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+                for (int index = 0; index < aggregation.groupingColumns().size(); index++) {
+                    row.put(aggregation.groupingColumns().get(index).columnName(), group.getKey().get(index));
+                }
+                for (StarRocksAggregateColumn aggregateColumn : aggregation.aggregateColumns()) {
+                    row.put(aggregateColumn.columnName(), evaluateAggregate(aggregateColumn.expression(), group.getValue()));
+                }
+                results.add(Collections.unmodifiableMap(row));
+            }
+            return List.copyOf(results);
+        }
+
+        private static long evaluateAggregate(String expression, List<Map<String, Object>> rows)
+        {
+            String normalized = expression.trim().toLowerCase(Locale.ENGLISH);
+            if (normalized.equals("count(*)")) {
+                return rows.size();
+            }
+            if (normalized.equals("count(null)")) {
+                return 0L;
+            }
+            if (normalized.startsWith("count(`") && normalized.endsWith("`)")) {
+                String columnName = normalized.substring("count(`".length(), normalized.length() - "`)".length()).replace("``", "`");
+                return rows.stream()
+                        .filter(row -> row.get(columnName) != null)
+                        .count();
+            }
+            throw new IllegalArgumentException("Unsupported testing aggregate expression: " + expression);
+        }
+
+        private static List<Map<String, Object>> applySort(List<StarRocksSortItem> sortOrder, List<Map<String, Object>> rows)
+        {
+            if (sortOrder.isEmpty()) {
+                return rows;
+            }
+
+            Comparator<Map<String, Object>> comparator = (left, right) -> {
+                for (StarRocksSortItem sortItem : sortOrder) {
+                    int result = compareValues(left.get(sortItem.columnName()), right.get(sortItem.columnName()), sortItem);
+                    if (result != 0) {
+                        return result;
+                    }
+                }
+                return 0;
+            };
+            return rows.stream()
+                    .sorted(comparator)
+                    .toList();
+        }
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private static int compareValues(Object left, Object right, StarRocksSortItem sortItem)
+        {
+            if (left == null || right == null) {
+                if (left == right) {
+                    return 0;
+                }
+                return (left == null) == sortItem.sortOrder().isNullsFirst() ? -1 : 1;
+            }
+
+            Object comparableLeft = toComparableValue(left);
+            Object comparableRight = toComparableValue(right);
+            int result = ((Comparable) comparableLeft).compareTo(comparableRight);
+            return sortItem.sortOrder().isAscending() ? result : -result;
+        }
+
+        private static Object toComparableValue(Object value)
+        {
+            if (value instanceof Slice slice) {
+                return slice.toStringUtf8();
+            }
+            return value;
+        }
+
+        private static Object toDomainValue(Object value, Type type)
+        {
+            if (value == null) {
+                return null;
+            }
+            if (type == BOOLEAN) {
+                return toBooleanValue(value);
+            }
+            if (type == TINYINT || type == SMALLINT || type == INTEGER || type == BIGINT) {
+                return toLong(value);
+            }
+            if (type == REAL) {
+                return (long) floatToRawIntBits(((Number) value).floatValue());
+            }
+            if (type == DOUBLE) {
+                return ((Number) value).doubleValue();
+            }
+            if (type == DATE) {
+                return toEpochDay(value);
+            }
+            if (type instanceof TimestampType timestampType && timestampType.isShort()) {
+                return toTimestampMicros(value);
+            }
+            if (type instanceof DecimalType decimalType) {
+                BigDecimal decimal = toBigDecimalValue(value);
+                if (decimalType.isShort()) {
+                    return encodeShortScaledValue(decimal, decimalType.getScale());
+                }
+            }
+            if (type instanceof VarcharType || type instanceof CharType || type.getBaseName().equals(JSON)) {
+                if (value instanceof Slice slice) {
+                    return slice;
+                }
+                return utf8Slice(value.toString());
+            }
+            return value;
+        }
+
+        private static long toTimestampMicros(Object value)
+        {
+            if (value instanceof LocalDateTime dateTime) {
+                return dateTime.toEpochSecond(java.time.ZoneOffset.UTC) * MICROSECONDS_PER_SECOND + (dateTime.getNano() / 1_000);
+            }
+            String text = value.toString().trim().replace(' ', 'T');
+            LocalDateTime dateTime = LocalDateTime.parse(text);
+            return dateTime.toEpochSecond(java.time.ZoneOffset.UTC) * MICROSECONDS_PER_SECOND + (dateTime.getNano() / 1_000);
         }
 
         private static StarRocksFlightSqlResult createResult(TestingTable table, List<StarRocksColumnHandle> columns, List<Map<String, Object>> rows)
@@ -522,7 +709,7 @@ final class TestingStarRocksEnvironment
                 vector.setValueCount(rows.size());
                 return vector;
             }
-            if (type instanceof VarcharType || type instanceof CharType) {
+            if (type instanceof VarcharType || type instanceof CharType || type.getBaseName().equals(JSON)) {
                 VarCharVector vector = new VarCharVector(name, allocator);
                 vector.allocateNew();
                 for (int i = 0; i < rows.size(); i++) {
@@ -531,7 +718,7 @@ final class TestingStarRocksEnvironment
                         vector.setNull(i);
                     }
                     else {
-                        vector.setSafe(i, toTextBytes(value));
+                        vector.setSafe(i, type.getBaseName().equals(JSON) ? toJsonBytes(value) : toTextBytes(value));
                     }
                 }
                 vector.setValueCount(rows.size());
@@ -609,6 +796,17 @@ final class TestingStarRocksEnvironment
                 return dateTime.toString().replace('T', ' ').getBytes(UTF_8);
             }
             return value.toString().getBytes(UTF_8);
+        }
+
+        private static byte[] toJsonBytes(Object value)
+        {
+            if (value instanceof Slice slice) {
+                return slice.getBytes();
+            }
+            if (value instanceof CharSequence) {
+                return value.toString().getBytes(UTF_8);
+            }
+            return JSON_CODEC.toJson(value).getBytes(UTF_8);
         }
 
         private static byte[] toBinaryBytes(Object value)

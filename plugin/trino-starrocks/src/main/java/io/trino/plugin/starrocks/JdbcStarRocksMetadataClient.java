@@ -43,10 +43,25 @@ public class JdbcStarRocksMetadataClient
             WHERE LOWER(SCHEMA_NAME) NOT IN ('information_schema', '_statistics_', 'sys')
             ORDER BY SCHEMA_NAME
             """;
+    private static final String LIST_SCHEMAS_IN_CATALOG_SQL = """
+            SELECT DISTINCT TABLE_SCHEMA AS SCHEMA_NAME
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_CATALOG = ?
+              AND LOWER(TABLE_SCHEMA) NOT IN ('information_schema', '_statistics_', 'sys')
+            ORDER BY TABLE_SCHEMA
+            """;
     private static final String LIST_ALL_TABLES_SQL = """
             SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
             FROM INFORMATION_SCHEMA.TABLES
             WHERE LOWER(TABLE_SCHEMA) NOT IN ('information_schema', '_statistics_', 'sys')
+              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+            """;
+    private static final String LIST_ALL_TABLES_IN_CATALOG_SQL = """
+            SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_CATALOG = ?
+              AND LOWER(TABLE_SCHEMA) NOT IN ('information_schema', '_statistics_', 'sys')
               AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
@@ -57,10 +72,27 @@ public class JdbcStarRocksMetadataClient
               AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
+    private static final String LIST_TABLES_IN_CATALOG_SCHEMA_SQL = """
+            SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_CATALOG = ?
+              AND LOWER(TABLE_SCHEMA) = LOWER(?)
+              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+            """;
     private static final String RESOLVE_TABLE_SQL = """
             SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
             FROM INFORMATION_SCHEMA.TABLES
             WHERE LOWER(TABLE_SCHEMA) = LOWER(?)
+              AND LOWER(TABLE_NAME) = LOWER(?)
+              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+            """;
+    private static final String RESOLVE_TABLE_IN_CATALOG_SQL = """
+            SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_CATALOG = ?
+              AND LOWER(TABLE_SCHEMA) = LOWER(?)
               AND LOWER(TABLE_NAME) = LOWER(?)
               AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
@@ -78,24 +110,51 @@ public class JdbcStarRocksMetadataClient
               AND LOWER(TABLE_NAME) = LOWER(?)
             ORDER BY ORDINAL_POSITION
             """;
+    private static final String LIST_COLUMNS_IN_CATALOG_SQL = """
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                COLUMN_TYPE,
+                COALESCE(CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION) AS COLUMN_SIZE,
+                COALESCE(NUMERIC_SCALE, DATETIME_PRECISION) AS DECIMAL_DIGITS,
+                ORDINAL_POSITION
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_CATALOG = ?
+              AND LOWER(TABLE_SCHEMA) = LOWER(?)
+              AND LOWER(TABLE_NAME) = LOWER(?)
+            ORDER BY ORDINAL_POSITION
+            """;
     private static final String TABLE_ROW_COUNT_SQL = """
             SELECT TABLE_ROWS
             FROM INFORMATION_SCHEMA.TABLES
             WHERE LOWER(TABLE_SCHEMA) = LOWER(?)
               AND LOWER(TABLE_NAME) = LOWER(?)
             """;
+    private static final String TABLE_ROW_COUNT_IN_CATALOG_SQL = """
+            SELECT TABLE_ROWS
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_CATALOG = ?
+              AND LOWER(TABLE_SCHEMA) = LOWER(?)
+              AND LOWER(TABLE_NAME) = LOWER(?)
+            """;
 
     private final StarRocksJdbcConnectionFactory connectionFactory;
+    private final Optional<String> catalogName;
 
     @Inject
-    public JdbcStarRocksMetadataClient(StarRocksJdbcConnectionFactory connectionFactory)
+    public JdbcStarRocksMetadataClient(StarRocksJdbcConnectionFactory connectionFactory, StarRocksConfig config)
     {
         this.connectionFactory = requireNonNull(connectionFactory, "connectionFactory is null");
+        this.catalogName = requireNonNull(config, "config is null").getCatalogName();
     }
 
     @Override
     public List<String> listSchemaNames(ConnectorSession session)
     {
+        if (catalogName.isPresent()) {
+            return loadSchemaNamesFromInformationSchema(session);
+        }
+
         List<String> schemas = loadSchemaNamesFromMetadata(session);
         if (!schemas.isEmpty()) {
             return schemas;
@@ -128,6 +187,7 @@ public class JdbcStarRocksMetadataClient
 
         return Optional.of(new StarRocksRemoteTable(
                 table.schemaTableName(),
+                table.remoteCatalogName(),
                 table.remoteSchemaName(),
                 table.remoteTableName(),
                 table.relationType(),
@@ -142,10 +202,15 @@ public class JdbcStarRocksMetadataClient
             return OptionalLong.empty();
         }
 
+        String sql = catalogName.isPresent() ? TABLE_ROW_COUNT_IN_CATALOG_SQL : TABLE_ROW_COUNT_SQL;
         try (Connection connection = openConnection(session);
-                PreparedStatement statement = connection.prepareStatement(TABLE_ROW_COUNT_SQL)) {
-            statement.setString(1, resolvedTable.orElseThrow().remoteSchemaName());
-            statement.setString(2, resolvedTable.orElseThrow().remoteTableName());
+                PreparedStatement statement = connection.prepareStatement(sql)) {
+            int index = 1;
+            if (catalogName.isPresent()) {
+                statement.setString(index++, catalogName.orElseThrow());
+            }
+            statement.setString(index++, resolvedTable.orElseThrow().remoteSchemaName());
+            statement.setString(index, resolvedTable.orElseThrow().remoteTableName());
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 if (!resultSet.next()) {
@@ -184,14 +249,19 @@ public class JdbcStarRocksMetadataClient
 
     private List<String> loadSchemaNamesFromInformationSchema(ConnectorSession session)
     {
+        String sql = catalogName.isPresent() ? LIST_SCHEMAS_IN_CATALOG_SQL : LIST_SCHEMAS_SQL;
         try (Connection connection = openConnection(session);
-                PreparedStatement statement = connection.prepareStatement(LIST_SCHEMAS_SQL);
-                ResultSet resultSet = statement.executeQuery()) {
-            List<String> schemas = new ArrayList<>();
-            while (resultSet.next()) {
-                schemas.add(lowercaseName(resultSet.getString("SCHEMA_NAME")));
+                PreparedStatement statement = connection.prepareStatement(sql)) {
+            if (catalogName.isPresent()) {
+                statement.setString(1, catalogName.orElseThrow());
             }
-            return schemas.stream().distinct().toList();
+            try (ResultSet resultSet = statement.executeQuery()) {
+                List<String> schemas = new ArrayList<>();
+                while (resultSet.next()) {
+                    schemas.add(lowercaseName(resultSet.getString("SCHEMA_NAME")));
+                }
+                return schemas.stream().distinct().toList();
+            }
         }
         catch (SQLException e) {
             throw StarRocksJdbcConnectionFactory.jdbcOperationFailed("Failed to list StarRocks schemas", e);
@@ -211,7 +281,7 @@ public class JdbcStarRocksMetadataClient
     {
         try (Connection connection = openConnection(session);
                 ResultSet resultSet = connection.getMetaData().getTables(
-                        connection.getCatalog(),
+                        catalogName.orElse(connection.getCatalog()),
                         schemaName.orElse(null),
                         null,
                         new String[] {"TABLE", "VIEW"})) {
@@ -223,7 +293,7 @@ public class JdbcStarRocksMetadataClient
                 if (!shouldExposeTable(remoteSchema, tableType)) {
                     continue;
                 }
-                tables.add(new ResolvedTable(remoteSchema, remoteTable, toRelationType(tableType)));
+                tables.add(new ResolvedTable(catalogName, remoteSchema, remoteTable, toRelationType(tableType)));
             }
             return tables.stream().distinct().toList();
         }
@@ -234,17 +304,28 @@ public class JdbcStarRocksMetadataClient
 
     private List<ResolvedTable> loadTablesFromInformationSchema(ConnectorSession session, Optional<String> schemaName)
     {
-        String sql = schemaName.isPresent() ? LIST_TABLES_IN_SCHEMA_SQL : LIST_ALL_TABLES_SQL;
+        String sql;
+        if (catalogName.isPresent()) {
+            sql = schemaName.isPresent() ? LIST_TABLES_IN_CATALOG_SCHEMA_SQL : LIST_ALL_TABLES_IN_CATALOG_SQL;
+        }
+        else {
+            sql = schemaName.isPresent() ? LIST_TABLES_IN_SCHEMA_SQL : LIST_ALL_TABLES_SQL;
+        }
         try (Connection connection = openConnection(session);
                 PreparedStatement statement = connection.prepareStatement(sql)) {
+            int index = 1;
+            if (catalogName.isPresent()) {
+                statement.setString(index++, catalogName.orElseThrow());
+            }
             if (schemaName.isPresent()) {
-                statement.setString(1, schemaName.get());
+                statement.setString(index, schemaName.get());
             }
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 List<ResolvedTable> tables = new ArrayList<>();
                 while (resultSet.next()) {
                     tables.add(new ResolvedTable(
+                            catalogName,
                             resultSet.getString("TABLE_SCHEMA"),
                             resultSet.getString("TABLE_NAME"),
                             toRelationType(resultSet.getString("TABLE_TYPE"))));
@@ -282,15 +363,21 @@ public class JdbcStarRocksMetadataClient
             return fromMetadata;
         }
 
+        String sql = catalogName.isPresent() ? RESOLVE_TABLE_IN_CATALOG_SQL : RESOLVE_TABLE_SQL;
         try (Connection connection = openConnection(session);
-                PreparedStatement statement = connection.prepareStatement(RESOLVE_TABLE_SQL)) {
-            statement.setString(1, tableName.getSchemaName());
-            statement.setString(2, tableName.getTableName());
+                PreparedStatement statement = connection.prepareStatement(sql)) {
+            int index = 1;
+            if (catalogName.isPresent()) {
+                statement.setString(index++, catalogName.orElseThrow());
+            }
+            statement.setString(index++, tableName.getSchemaName());
+            statement.setString(index, tableName.getTableName());
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 List<ResolvedTable> matches = new ArrayList<>();
                 while (resultSet.next()) {
                     matches.add(new ResolvedTable(
+                            catalogName,
                             resultSet.getString("TABLE_SCHEMA"),
                             resultSet.getString("TABLE_NAME"),
                             toRelationType(resultSet.getString("TABLE_TYPE"))));
@@ -332,7 +419,7 @@ public class JdbcStarRocksMetadataClient
     {
         try (Connection connection = openConnection(session);
                 ResultSet resultSet = connection.getMetaData().getColumns(
-                        connection.getCatalog(),
+                        resolvedTable.remoteCatalogName().orElse(connection.getCatalog()),
                         resolvedTable.remoteSchemaName(),
                         resolvedTable.remoteTableName(),
                         null)) {
@@ -358,10 +445,15 @@ public class JdbcStarRocksMetadataClient
     private List<StarRocksRemoteColumn> loadColumnsFromInformationSchema(ConnectorSession session, ResolvedTable resolvedTable)
             throws SQLException
     {
+        String sql = catalogName.isPresent() ? LIST_COLUMNS_IN_CATALOG_SQL : LIST_COLUMNS_SQL;
         try (Connection connection = openConnection(session);
-                PreparedStatement statement = connection.prepareStatement(LIST_COLUMNS_SQL)) {
-            statement.setString(1, resolvedTable.remoteSchemaName());
-            statement.setString(2, resolvedTable.remoteTableName());
+                PreparedStatement statement = connection.prepareStatement(sql)) {
+            int index = 1;
+            if (catalogName.isPresent()) {
+                statement.setString(index++, catalogName.orElseThrow());
+            }
+            statement.setString(index++, resolvedTable.remoteSchemaName());
+            statement.setString(index, resolvedTable.remoteTableName());
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 List<StarRocksRemoteColumn> columns = new ArrayList<>();
@@ -452,7 +544,7 @@ public class JdbcStarRocksMetadataClient
         return value.toLowerCase(Locale.ENGLISH);
     }
 
-    private record ResolvedTable(String remoteSchemaName, String remoteTableName, StarRocksRelationType relationType)
+    private record ResolvedTable(Optional<String> remoteCatalogName, String remoteSchemaName, String remoteTableName, StarRocksRelationType relationType)
     {
         private SchemaTableName schemaTableName()
         {

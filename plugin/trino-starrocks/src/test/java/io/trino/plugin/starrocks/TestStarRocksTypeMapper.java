@@ -26,16 +26,18 @@ import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
 import static io.trino.spi.type.SmallintType.SMALLINT;
+import static io.trino.spi.type.StandardTypes.JSON;
 import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
 import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.spi.type.VarcharType.createVarcharType;
+import static io.trino.type.InternalTypeManager.TESTING_TYPE_MANAGER;
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class TestStarRocksTypeMapper
 {
-    private final StarRocksTypeMapper mapper = new StarRocksTypeMapper();
+    private final StarRocksTypeMapper mapper = new StarRocksTypeMapper(TESTING_TYPE_MANAGER);
 
     @Test
     void testPrimitiveMappings()
@@ -74,10 +76,12 @@ final class TestStarRocksTypeMapper
     @Test
     void testStarRocksSpecificAndUnknownTypesFallbackToVarchar()
     {
+        assertThat(mapper.toTrinoType(column("json_payload", "JSON", null, null, 1, "json")).getBaseName()).isEqualTo(JSON);
+        assertThat(mapper.toTrinoType(column("variant_payload", "VARIANT", null, null, 2, "variant")).getBaseName()).isEqualTo(JSON);
         assertThat(mapper.toTrinoType(column("large_id", "DECIMAL", null, null, 1, "largeint"))).isEqualTo(createUnboundedVarcharType());
-        assertThat(mapper.toTrinoType(column("bitmap_summary", "BITMAP", null, null, 2, "bitmap"))).isEqualTo(createUnboundedVarcharType());
-        assertThat(mapper.toTrinoType(column("details", "STRUCT", null, null, 3, "struct<a:int,b:varchar(12)>"))).isEqualTo(createUnboundedVarcharType());
-        assertThat(mapper.toTrinoType(column("mystery", "GEOGRAPHY", null, null, 4))).isEqualTo(createUnboundedVarcharType());
+        assertThat(mapper.toTrinoType(column("bitmap_summary", "BITMAP", null, null, 3, "bitmap"))).isEqualTo(createUnboundedVarcharType());
+        assertThat(mapper.toTrinoType(column("details", "STRUCT", null, null, 4, "struct<a:int,b:varchar(12)>"))).isEqualTo(createUnboundedVarcharType());
+        assertThat(mapper.toTrinoType(column("mystery", "GEOGRAPHY", null, null, 5))).isEqualTo(createUnboundedVarcharType());
     }
 
     private static StarRocksRemoteColumn column(String name, String type, Integer size, Integer scale, int ordinalPosition)

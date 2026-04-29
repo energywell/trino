@@ -28,6 +28,7 @@ final class TestStarRocksConfig
     {
         assertRecordedDefaults(recordDefaults(StarRocksConfig.class)
                 .setJdbcUrl(null)
+                .setCatalogName(null)
                 .setUsername(null)
                 .setPassword(null)
                 .setFlightSqlHost(null)
@@ -39,6 +40,7 @@ final class TestStarRocksConfig
     {
         Map<String, String> properties = Map.ofEntries(
                 Map.entry("starrocks.jdbc-url", "jdbc:starrocks://fe.example.net:9030"),
+                Map.entry("starrocks.catalog-name", "external_catalog"),
                 Map.entry("starrocks.username", "trino"),
                 Map.entry("starrocks.password", "secret"),
                 Map.entry("starrocks.flight-sql-host", "flight.example.net"),
@@ -46,6 +48,7 @@ final class TestStarRocksConfig
 
         StarRocksConfig expected = new StarRocksConfig()
                 .setJdbcUrl("jdbc:starrocks://fe.example.net:9030")
+                .setCatalogName("external_catalog")
                 .setUsername("trino")
                 .setPassword("secret")
                 .setFlightSqlHost("flight.example.net")

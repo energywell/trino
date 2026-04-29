@@ -13,15 +13,15 @@
  */
 package io.trino.plugin.starrocks;
 
-import io.trino.spi.connector.SchemaTableName;
-
 import java.util.List;
-import java.util.Optional;
 
-record StarRocksRemoteTable(
-        SchemaTableName schemaTableName,
-        Optional<String> remoteCatalogName,
-        String remoteSchemaName,
-        String remoteTableName,
-        StarRocksRelationType relationType,
-        List<StarRocksRemoteColumn> columns) {}
+import static java.util.Objects.requireNonNull;
+
+public record StarRocksAggregation(List<StarRocksColumnHandle> groupingColumns, List<StarRocksAggregateColumn> aggregateColumns)
+{
+    public StarRocksAggregation
+    {
+        groupingColumns = List.copyOf(requireNonNull(groupingColumns, "groupingColumns is null"));
+        aggregateColumns = List.copyOf(requireNonNull(aggregateColumns, "aggregateColumns is null"));
+    }
+}
