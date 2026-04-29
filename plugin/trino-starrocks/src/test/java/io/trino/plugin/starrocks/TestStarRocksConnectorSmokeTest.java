@@ -66,10 +66,11 @@ final class TestStarRocksConnectorSmokeTest
                     List.of(
                             new StarRocksRemoteColumn("metric_key", "metric_key", "BIGINT", Optional.of(20), Optional.empty(), 1, Optional.empty()),
                             new StarRocksRemoteColumn("largeint_summary", "largeint_summary", "DECIMAL", Optional.empty(), Optional.empty(), 2, Optional.of("largeint")),
-                            new StarRocksRemoteColumn("bitmap_summary", "bitmap_summary", "BITMAP", Optional.empty(), Optional.empty(), 3, Optional.of("bitmap"))),
+                            new StarRocksRemoteColumn("bitmap_summary", "bitmap_summary", "BITMAP", Optional.empty(), Optional.empty(), 3, Optional.of("bitmap")),
+                            new StarRocksRemoteColumn("json_payload", "json_payload", "JSON", Optional.empty(), Optional.empty(), 4, Optional.of("json"))),
                     List.of(
-                            Map.of("metric_key", 10L, "largeint_summary", "9223372036854775809", "bitmap_summary", "1,3,5"),
-                            Map.of("metric_key", 11L, "largeint_summary", "-1", "bitmap_summary", "2,4")))));
+                            Map.of("metric_key", 10L, "largeint_summary", "9223372036854775809", "bitmap_summary", "1,3,5", "json_payload", "{\"kind\":\"bitmap\",\"count\":3}"),
+                            Map.of("metric_key", 11L, "largeint_summary", "-1", "bitmap_summary", "2,4", "json_payload", "{\"kind\":\"bitmap\",\"count\":2}")))));
 
     @Override
     protected QueryRunner createQueryRunner()
@@ -82,6 +83,7 @@ final class TestStarRocksConnectorSmokeTest
     protected boolean hasBehavior(TestingConnectorBehavior connectorBehavior)
     {
         return switch (connectorBehavior) {
+            case SUPPORTS_TOPN_PUSHDOWN_WITH_VARCHAR -> true;
             case SUPPORTS_ADD_COLUMN,
                     SUPPORTS_ARRAY,
                     SUPPORTS_COMMENT_ON_COLUMN,
@@ -94,12 +96,11 @@ final class TestStarRocksConnectorSmokeTest
                     SUPPORTS_DYNAMIC_FILTER_PUSHDOWN,
                     SUPPORTS_INSERT,
                     SUPPORTS_JOIN_PUSHDOWN,
-                    SUPPORTS_LIMIT_PUSHDOWN,
                     SUPPORTS_MAP_TYPE,
                     SUPPORTS_MERGE,
                     SUPPORTS_NATIVE_QUERY,
                     SUPPORTS_NOT_NULL_CONSTRAINT,
-                    SUPPORTS_PREDICATE_PUSHDOWN,
+                    SUPPORTS_PREDICATE_PUSHDOWN_WITH_VARCHAR_INEQUALITY,
                     SUPPORTS_PREDICATE_EXPRESSION_PUSHDOWN,
                     SUPPORTS_RENAME_COLUMN,
                     SUPPORTS_RENAME_TABLE,
@@ -107,8 +108,6 @@ final class TestStarRocksConnectorSmokeTest
                     SUPPORTS_SET_COLUMN_TYPE,
                     SUPPORTS_AGGREGATION_PUSHDOWN,
                     SUPPORTS_AGGREGATION_PUSHDOWN_COUNT_DISTINCT,
-                    SUPPORTS_TOPN_PUSHDOWN,
-                    SUPPORTS_TOPN_PUSHDOWN_WITH_VARCHAR,
                     SUPPORTS_UPDATE,
                     SUPPORTS_AGGREGATION_PUSHDOWN_CORRELATION,
                     SUPPORTS_AGGREGATION_PUSHDOWN_COVARIANCE,
@@ -183,5 +182,25 @@ final class TestStarRocksConnectorSmokeTest
         assertQuery(
                 "SELECT metric_key, largeint_summary, bitmap_summary FROM starrocks.starrocks_test.starrocks_specific ORDER BY metric_key",
                 "VALUES (10, '9223372036854775809', '1,3,5'), (11, '-1', '2,4')");
+        assertQuery(
+                "SELECT metric_key, json_format(json_payload) FROM starrocks.starrocks_test.starrocks_specific ORDER BY metric_key",
+                "VALUES (10, '{\"kind\":\"bitmap\",\"count\":3}'), (11, '{\"kind\":\"bitmap\",\"count\":2}')");
+    }
+
+    @Test
+    void testStarRocksPushdowns()
+    {
+        assertQuery("SELECT id FROM starrocks.starrocks_test.events WHERE id >= 2 ORDER BY id DESC LIMIT 1", "VALUES 3");
+        TestingStarRocksEnvironment.Request topNRequest = environment.getLastRequest().orElseThrow();
+        assertThat(topNRequest.tableHandle().constraint().isAll()).isFalse();
+        assertThat(topNRequest.tableHandle().sortOrder()).hasSize(1);
+        assertThat(topNRequest.tableHandle().limit()).hasValue(1);
+
+        assertQuery("SELECT count(*) FROM starrocks.starrocks_test.events WHERE id >= 2", "VALUES 2");
+        TestingStarRocksEnvironment.Request countRequest = environment.getLastRequest().orElseThrow();
+        assertThat(countRequest.tableHandle().constraint().isAll()).isFalse();
+        assertThat(countRequest.tableHandle().aggregation()).isPresent();
+        assertThat(countRequest.requestedColumns()).extracting(StarRocksColumnHandle::columnName)
+                .containsExactly("_starrocks_agg_0");
     }
 }

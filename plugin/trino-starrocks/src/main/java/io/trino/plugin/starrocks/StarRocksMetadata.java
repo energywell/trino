@@ -15,6 +15,9 @@ package io.trino.plugin.starrocks;
 
 import com.google.inject.Inject;
 import io.trino.spi.TrinoException;
+import io.trino.spi.connector.AggregateFunction;
+import io.trino.spi.connector.AggregationApplicationResult;
+import io.trino.spi.connector.Assignment;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.ConnectorMetadata;
@@ -22,9 +25,19 @@ import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.ConnectorTableVersion;
+import io.trino.spi.connector.Constraint;
+import io.trino.spi.connector.ConstraintApplicationResult;
+import io.trino.spi.connector.LimitApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.SchemaTablePrefix;
+import io.trino.spi.connector.SortItem;
 import io.trino.spi.connector.TableNotFoundException;
+import io.trino.spi.connector.TopNApplicationResult;
+import io.trino.spi.expression.ConnectorExpression;
+import io.trino.spi.expression.Constant;
+import io.trino.spi.expression.Variable;
+import io.trino.spi.predicate.Domain;
+import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.statistics.Estimate;
 import io.trino.spi.statistics.TableStatistics;
 
@@ -73,6 +86,7 @@ public class StarRocksMetadata
                 .map(remoteTable -> new StarRocksTableHandle(
                         tableName.getSchemaName(),
                         tableName.getTableName(),
+                        remoteTable.remoteCatalogName(),
                         remoteTable.remoteSchemaName(),
                         remoteTable.remoteTableName(),
                         remoteTable.relationType()))
@@ -134,6 +148,10 @@ public class StarRocksMetadata
     public TableStatistics getTableStatistics(ConnectorSession session, ConnectorTableHandle table)
     {
         StarRocksTableHandle handle = (StarRocksTableHandle) table;
+        if (handle.aggregation().isPresent() || !handle.constraint().isAll() || handle.limit().isPresent()) {
+            return TableStatistics.empty();
+        }
+
         OptionalLong rowCount = metadataClient.getTableRowCount(session, handle.toSchemaTableName());
         if (rowCount.isEmpty()) {
             return TableStatistics.empty();
@@ -142,6 +160,131 @@ public class StarRocksMetadata
         return TableStatistics.builder()
                 .setRowCount(Estimate.of((double) rowCount.getAsLong()))
                 .build();
+    }
+
+    @Override
+    public Optional<LimitApplicationResult<ConnectorTableHandle>> applyLimit(ConnectorSession session, ConnectorTableHandle table, long limit)
+    {
+        StarRocksTableHandle handle = (StarRocksTableHandle) table;
+        if (handle.limit().isPresent() && handle.limit().getAsLong() <= limit) {
+            return Optional.empty();
+        }
+        return Optional.of(new LimitApplicationResult<>(handle.withLimit(limit), true, false));
+    }
+
+    @Override
+    public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(ConnectorSession session, ConnectorTableHandle table, Constraint constraint)
+    {
+        StarRocksTableHandle handle = (StarRocksTableHandle) table;
+        if (handle.aggregation().isPresent()) {
+            return Optional.empty();
+        }
+        if (constraint.getSummary().isNone()) {
+            if (handle.constraint().isNone()) {
+                return Optional.empty();
+            }
+            return Optional.of(new ConstraintApplicationResult<>(
+                    handle.withConstraint(TupleDomain.none()),
+                    TupleDomain.all(),
+                    constraint.getExpression(),
+                    false));
+        }
+
+        Map<StarRocksColumnHandle, Domain> supported = new LinkedHashMap<>();
+        Map<ColumnHandle, Domain> unsupported = new LinkedHashMap<>();
+        if (constraint.getSummary().getDomains().isPresent()) {
+            for (Map.Entry<ColumnHandle, Domain> entry : constraint.getSummary().getDomains().orElseThrow().entrySet()) {
+                if (entry.getKey() instanceof StarRocksColumnHandle columnHandle &&
+                        StarRocksQueryBuilder.buildColumnPredicate(columnHandle, entry.getValue()).isPresent()) {
+                    supported.put(columnHandle, entry.getValue());
+                }
+                else {
+                    unsupported.put(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+
+        TupleDomain<StarRocksColumnHandle> newDomain = handle.constraint().intersect(TupleDomain.withColumnDomains(supported));
+        if (handle.constraint().equals(newDomain)) {
+            return Optional.empty();
+        }
+        return Optional.of(new ConstraintApplicationResult<>(
+                handle.withConstraint(newDomain),
+                TupleDomain.withColumnDomains(unsupported),
+                constraint.getExpression(),
+                false));
+    }
+
+    @Override
+    public Optional<TopNApplicationResult<ConnectorTableHandle>> applyTopN(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            long topNCount,
+            List<SortItem> sortItems,
+            Map<String, ColumnHandle> assignments)
+    {
+        StarRocksTableHandle handle = (StarRocksTableHandle) table;
+        List<StarRocksSortItem> sortOrder = toStarRocksSortOrder(sortItems, assignments);
+        if (sortOrder.isEmpty()) {
+            return Optional.empty();
+        }
+        if (!handle.sortOrder().isEmpty() && !handle.sortOrder().equals(sortOrder)) {
+            return Optional.empty();
+        }
+        if (handle.sortOrder().equals(sortOrder) && handle.limit().isPresent() && handle.limit().getAsLong() <= topNCount) {
+            return Optional.empty();
+        }
+        return Optional.of(new TopNApplicationResult<>(handle.withTopN(topNCount, sortOrder), true, false));
+    }
+
+    @Override
+    public Optional<AggregationApplicationResult<ConnectorTableHandle>> applyAggregation(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            List<AggregateFunction> aggregates,
+            Map<String, ColumnHandle> assignments,
+            List<List<ColumnHandle>> groupingSets)
+    {
+        StarRocksTableHandle handle = (StarRocksTableHandle) table;
+        if (handle.aggregation().isPresent() || handle.limit().isPresent() || !handle.sortOrder().isEmpty()) {
+            return Optional.empty();
+        }
+        if (groupingSets.size() != 1) {
+            return Optional.empty();
+        }
+
+        List<StarRocksColumnHandle> groupingColumns = new ArrayList<>();
+        for (ColumnHandle groupingColumn : groupingSets.getFirst()) {
+            if (!(groupingColumn instanceof StarRocksColumnHandle starRocksColumnHandle)) {
+                return Optional.empty();
+            }
+            groupingColumns.add(starRocksColumnHandle);
+        }
+
+        List<ConnectorExpression> projections = new ArrayList<>(aggregates.size());
+        List<Assignment> resultAssignments = new ArrayList<>(aggregates.size());
+        List<StarRocksAggregateColumn> aggregateColumns = new ArrayList<>(aggregates.size());
+        for (int index = 0; index < aggregates.size(); index++) {
+            AggregateFunction aggregate = aggregates.get(index);
+            Optional<String> aggregateExpression = toAggregationExpression(aggregate, assignments);
+            if (aggregateExpression.isEmpty()) {
+                return Optional.empty();
+            }
+
+            String columnName = "_starrocks_agg_" + index;
+            StarRocksAggregateColumn aggregateColumn = new StarRocksAggregateColumn(columnName, aggregateExpression.orElseThrow(), aggregate.getOutputType());
+            StarRocksColumnHandle columnHandle = new StarRocksColumnHandle(columnName, columnName, aggregate.getOutputType(), groupingColumns.size() + index);
+            aggregateColumns.add(aggregateColumn);
+            projections.add(new Variable(columnName, aggregate.getOutputType()));
+            resultAssignments.add(new Assignment(columnName, columnHandle, aggregate.getOutputType()));
+        }
+
+        return Optional.of(new AggregationApplicationResult<>(
+                handle.withAggregation(new StarRocksAggregation(groupingColumns, aggregateColumns)),
+                projections,
+                resultAssignments,
+                Map.of(),
+                false));
     }
 
     private Optional<StarRocksRemoteTable> getRemoteTable(ConnectorSession session, StarRocksTableHandle tableHandle)
@@ -179,6 +322,51 @@ public class StarRocksMetadata
                     column.ordinalPosition() - 1));
         }
         return List.copyOf(columnHandles);
+    }
+
+    private static List<StarRocksSortItem> toStarRocksSortOrder(List<SortItem> sortItems, Map<String, ColumnHandle> assignments)
+    {
+        List<StarRocksSortItem> sortOrder = new ArrayList<>(sortItems.size());
+        for (SortItem sortItem : sortItems) {
+            ColumnHandle columnHandle = assignments.get(sortItem.getName());
+            if (!(columnHandle instanceof StarRocksColumnHandle starRocksColumnHandle) || !starRocksColumnHandle.columnType().isOrderable()) {
+                return List.of();
+            }
+            sortOrder.add(new StarRocksSortItem(starRocksColumnHandle.columnName(), starRocksColumnHandle.remoteColumnName(), sortItem.getSortOrder()));
+        }
+        return List.copyOf(sortOrder);
+    }
+
+    private static Optional<String> toAggregationExpression(AggregateFunction aggregate, Map<String, ColumnHandle> assignments)
+    {
+        if (!aggregate.getFunctionName().equals("count") ||
+                aggregate.isDistinct() ||
+                aggregate.getFilter().isPresent() ||
+                !aggregate.getSortItems().isEmpty()) {
+            return Optional.empty();
+        }
+        if (aggregate.getArguments().isEmpty()) {
+            return Optional.of("count(*)");
+        }
+        if (aggregate.getArguments().size() != 1) {
+            return Optional.empty();
+        }
+
+        ConnectorExpression argument = aggregate.getArguments().getFirst();
+        if (argument instanceof Variable variable) {
+            ColumnHandle columnHandle = assignments.get(variable.getName());
+            if (columnHandle instanceof StarRocksColumnHandle starRocksColumnHandle) {
+                return Optional.of("count(" + StarRocksQueryBuilder.quoteIdentifier(starRocksColumnHandle.remoteColumnName()) + ")");
+            }
+            return Optional.empty();
+        }
+        if (argument instanceof Constant constant) {
+            if (constant.getValue() == null) {
+                return Optional.of("count(NULL)");
+            }
+            return Optional.of("count(*)");
+        }
+        return Optional.empty();
     }
 
     private List<SchemaTableName> listTables(ConnectorSession session, SchemaTablePrefix prefix)

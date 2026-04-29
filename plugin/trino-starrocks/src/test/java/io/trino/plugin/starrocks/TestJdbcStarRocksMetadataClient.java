@@ -46,7 +46,7 @@ final class TestJdbcStarRocksMetadataClient
     void testListSchemaNamesFallsBackToInformationSchemaWhenMetadataFails()
     {
         AtomicReference<String> preparedSql = new AtomicReference<>();
-        JdbcStarRocksMetadataClient client = new JdbcStarRocksMetadataClient(connectionFactory(
+        JdbcStarRocksMetadataClient client = metadataClient(connectionFactory(
                 () -> {
                     throw new SQLException("getSchemas failed");
                 },
@@ -66,7 +66,7 @@ final class TestJdbcStarRocksMetadataClient
     {
         List<String> preparedSql = new ArrayList<>();
         List<List<String>> boundParameters = new ArrayList<>();
-        JdbcStarRocksMetadataClient client = new JdbcStarRocksMetadataClient(connectionFactory(
+        JdbcStarRocksMetadataClient client = metadataClient(connectionFactory(
                 () -> createResultSet(List.of()),
                 (_, _, _) -> List.of(
                         row(
@@ -124,7 +124,7 @@ final class TestJdbcStarRocksMetadataClient
     {
         List<String> preparedSql = new ArrayList<>();
         List<List<String>> boundParameters = new ArrayList<>();
-        JdbcStarRocksMetadataClient client = new JdbcStarRocksMetadataClient(connectionFactory(
+        JdbcStarRocksMetadataClient client = metadataClient(connectionFactory(
                 () -> createResultSet(List.of()),
                 (_, _, _) -> List.of(
                         row(
@@ -161,6 +161,37 @@ final class TestJdbcStarRocksMetadataClient
     }
 
     @Test
+    void testGetTableUsesConfiguredCatalog()
+    {
+        List<String> preparedSql = new ArrayList<>();
+        List<List<String>> boundParameters = new ArrayList<>();
+        JdbcStarRocksMetadataClient client = metadataClient(
+                connectionFactory(
+                        () -> createResultSet(List.of()),
+                        (_, _, _) -> List.of(),
+                        preparedSql::add,
+                        List.of(
+                                List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "BASE TABLE")),
+                                List.of(row(
+                                        "COLUMN_NAME", "event_id",
+                                        "DATA_TYPE", "BIGINT",
+                                        "COLUMN_TYPE", "bigint",
+                                        "COLUMN_SIZE", 20,
+                                        "DECIMAL_DIGITS", null,
+                                        "ORDINAL_POSITION", 1))),
+                        boundParameters),
+                new StarRocksConfig().setCatalogName("external_catalog"));
+
+        StarRocksRemoteTable table = client.getTable(SESSION, new SchemaTableName("analytics", "events")).orElseThrow();
+
+        assertThat(table.remoteCatalogName()).contains("external_catalog");
+        assertThat(preparedSql.getFirst()).contains("TABLE_CATALOG = ?");
+        assertThat(preparedSql.get(1)).contains("TABLE_CATALOG = ?");
+        assertThat(boundParameters.get(0)).containsExactly("external_catalog", "analytics");
+        assertThat(boundParameters.get(1)).containsExactly("external_catalog", "analytics", "events");
+    }
+
+    @Test
     void testGetTableFallsBackToJdbcMetadataColumnsWhenInformationSchemaFails()
     {
         List<String> preparedSql = new ArrayList<>();
@@ -169,7 +200,7 @@ final class TestJdbcStarRocksMetadataClient
         rowsByStatement.add(List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "BASE TABLE")));
         rowsByStatement.add(null);
 
-        JdbcStarRocksMetadataClient client = new JdbcStarRocksMetadataClient(connectionFactory(
+        JdbcStarRocksMetadataClient client = metadataClient(connectionFactory(
                 () -> createResultSet(List.of()),
                 (_, _, _) -> List.of(
                         row(
@@ -220,6 +251,16 @@ final class TestJdbcStarRocksMetadataClient
                 return openConnection();
             }
         };
+    }
+
+    private static JdbcStarRocksMetadataClient metadataClient(StarRocksJdbcConnectionFactory connectionFactory)
+    {
+        return new JdbcStarRocksMetadataClient(connectionFactory, new StarRocksConfig());
+    }
+
+    private static JdbcStarRocksMetadataClient metadataClient(StarRocksJdbcConnectionFactory connectionFactory, StarRocksConfig config)
+    {
+        return new JdbcStarRocksMetadataClient(connectionFactory, config);
     }
 
     private static Connection createConnection(

@@ -53,6 +53,7 @@ import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.spi.type.VarcharType.createVarcharType;
+import static io.trino.type.JsonType.JSON;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.ZoneOffset.UTC;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -71,7 +72,8 @@ final class TestStarRocksArrowToPageConverter
                 new StarRocksColumnHandle("id", "id", BIGINT, 3),
                 new StarRocksColumnHandle("ratio", "ratio", REAL, 4),
                 new StarRocksColumnHandle("name", "name", createVarcharType(20), 5),
-                new StarRocksColumnHandle("code", "code", createCharType(3), 6));
+                new StarRocksColumnHandle("code", "code", createCharType(3), 6),
+                new StarRocksColumnHandle("payload", "payload", JSON, 7));
 
         try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
                 BitVector flag = new BitVector("flag", allocator);
@@ -81,7 +83,8 @@ final class TestStarRocksArrowToPageConverter
                 Float4Vector ratio = new Float4Vector("ratio", allocator);
                 VarCharVector name = new VarCharVector("name", allocator);
                 VarCharVector code = new VarCharVector("code", allocator);
-                VectorSchemaRoot root = new VectorSchemaRoot(List.of(flag, tiny, small, id, ratio, name, code))) {
+                VarCharVector payload = new VarCharVector("payload", allocator);
+                VectorSchemaRoot root = new VectorSchemaRoot(List.of(flag, tiny, small, id, ratio, name, code, payload))) {
             flag.allocateNew();
             flag.setSafe(0, 1);
             flag.setNull(1);
@@ -117,6 +120,11 @@ final class TestStarRocksArrowToPageConverter
             code.setNull(1);
             code.setValueCount(2);
 
+            payload.allocateNew();
+            payload.setSafe(0, "{\"a\":1}".getBytes(UTF_8));
+            payload.setNull(1);
+            payload.setValueCount(2);
+
             root.setRowCount(2);
 
             Page page = convert(columns, root);
@@ -129,6 +137,8 @@ final class TestStarRocksArrowToPageConverter
             assertThat(REAL.getFloat(page.getBlock(4), 0)).isEqualTo(1.5f);
             assertThat(createVarcharType(20).getObjectValue(page.getBlock(5), 0)).isEqualTo("alpha");
             assertThat(createCharType(3).getObjectValue(page.getBlock(6), 0)).isEqualTo("xy ");
+            assertThat(JSON.getObjectValue(page.getBlock(7), 0)).isEqualTo("{\"a\":1}");
+            assertThat(page.getBlock(7).isNull(1)).isTrue();
         }
     }
 

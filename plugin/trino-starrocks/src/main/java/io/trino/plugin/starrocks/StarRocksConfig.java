@@ -23,6 +23,7 @@ import java.util.Optional;
 public class StarRocksConfig
 {
     private String jdbcUrl;
+    private String catalogName;
     private String username;
     private String password;
     private String flightSqlHost;
@@ -38,6 +39,19 @@ public class StarRocksConfig
     public StarRocksConfig setJdbcUrl(String jdbcUrl)
     {
         this.jdbcUrl = jdbcUrl;
+        return this;
+    }
+
+    public Optional<String> getCatalogName()
+    {
+        return Optional.ofNullable(catalogName);
+    }
+
+    @Config("starrocks.catalog-name")
+    @ConfigDescription("StarRocks catalog name to expose through this Trino catalog")
+    public StarRocksConfig setCatalogName(String catalogName)
+    {
+        this.catalogName = catalogName;
         return this;
     }
 

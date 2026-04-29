@@ -13,8 +13,12 @@
  */
 package io.trino.plugin.starrocks;
 
+import com.google.inject.Inject;
 import io.trino.spi.type.CharType;
+import io.trino.spi.type.StandardTypes;
 import io.trino.spi.type.Type;
+import io.trino.spi.type.TypeManager;
+import io.trino.spi.type.TypeSignature;
 import io.trino.spi.type.VarcharType;
 
 import java.util.Arrays;
@@ -45,6 +49,14 @@ public class StarRocksTypeMapper
 {
     private static final int MAX_STARROCKS_TIMESTAMP_PRECISION = 6;
 
+    private final Type jsonType;
+
+    @Inject
+    public StarRocksTypeMapper(TypeManager typeManager)
+    {
+        this.jsonType = typeManager.getType(new TypeSignature(StandardTypes.JSON));
+    }
+
     public Type toTrinoType(StarRocksRemoteColumn column)
     {
         String normalizedType = normalizedBaseType(column);
@@ -61,7 +73,8 @@ public class StarRocksTypeMapper
             case "DOUBLE" -> DOUBLE;
             case "CHAR" -> toCharType(column);
             case "VARCHAR" -> toVarcharType(column);
-            case "STRING", "TEXT", "JSON", "BITMAP", "HLL", "PERCENTILE", "PERCENTILE_UNION", "ARRAY", "MAP", "STRUCT", "VARIANT" -> createUnboundedVarcharType();
+            case "JSON", "VARIANT" -> jsonType;
+            case "STRING", "TEXT", "BITMAP", "HLL", "PERCENTILE", "PERCENTILE_UNION", "ARRAY", "MAP", "STRUCT" -> createUnboundedVarcharType();
             case "BINARY", "VARBINARY" -> VARBINARY;
             case "DATE" -> DATE;
             case "DATETIME", "DATETIMEV2", "TIMESTAMP" -> createTimestampType(timestampPrecision(column));

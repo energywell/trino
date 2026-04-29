@@ -13,15 +13,16 @@
  */
 package io.trino.plugin.starrocks;
 
-import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.connector.SortOrder;
 
-import java.util.List;
-import java.util.Optional;
+import static java.util.Objects.requireNonNull;
 
-record StarRocksRemoteTable(
-        SchemaTableName schemaTableName,
-        Optional<String> remoteCatalogName,
-        String remoteSchemaName,
-        String remoteTableName,
-        StarRocksRelationType relationType,
-        List<StarRocksRemoteColumn> columns) {}
+public record StarRocksSortItem(String columnName, String remoteColumnName, SortOrder sortOrder)
+{
+    public StarRocksSortItem
+    {
+        requireNonNull(columnName, "columnName is null");
+        requireNonNull(remoteColumnName, "remoteColumnName is null");
+        requireNonNull(sortOrder, "sortOrder is null");
+    }
+}

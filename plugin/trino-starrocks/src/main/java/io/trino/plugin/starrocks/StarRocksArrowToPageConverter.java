@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.starrocks;
 
+import io.airlift.json.JsonCodec;
 import io.airlift.slice.Slice;
 import io.trino.spi.Page;
 import io.trino.spi.PageBuilder;
@@ -57,7 +58,9 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
 import java.util.List;
+import java.util.Map;
 
+import static io.airlift.json.JsonCodec.jsonCodec;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
@@ -69,6 +72,7 @@ import static io.trino.spi.type.Decimals.overflows;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
 import static io.trino.spi.type.SmallintType.SMALLINT;
+import static io.trino.spi.type.StandardTypes.JSON;
 import static io.trino.spi.type.TimestampType.TIMESTAMP_MICROS;
 import static io.trino.spi.type.Timestamps.MICROSECONDS_PER_MILLISECOND;
 import static io.trino.spi.type.Timestamps.MICROSECONDS_PER_SECOND;
@@ -83,6 +87,7 @@ import static java.util.Objects.requireNonNull;
 
 public class StarRocksArrowToPageConverter
 {
+    private static final JsonCodec<Object> JSON_CODEC = jsonCodec(Object.class);
     private static final long MAX_SECONDS_MAGNITUDE = 10_000_000_000L;
     private static final long MAX_MILLIS_MAGNITUDE = 10_000_000_000_000L;
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE;
@@ -204,6 +209,10 @@ public class StarRocksArrowToPageConverter
     {
         if (type == VARBINARY) {
             type.writeSlice(output, wrappedBuffer(readBinaryValue(vector, index)));
+            return;
+        }
+        if (type.getBaseName().equals(JSON)) {
+            type.writeSlice(output, utf8Slice(readJsonTextValue(vector, index)));
             return;
         }
 
@@ -379,6 +388,49 @@ public class StarRocksArrowToPageConverter
             return fixedSizeBinaryVector.get(index);
         }
         return readTextValue(vector, index).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static String readJsonTextValue(FieldVector vector, int index)
+    {
+        if (vector instanceof VarCharVector || vector instanceof LargeVarCharVector) {
+            return readTextValue(vector, index);
+        }
+
+        Object value = vector.getObject(index);
+        if (value instanceof Slice slice) {
+            return slice.toStringUtf8();
+        }
+        if (value instanceof CharSequence) {
+            return value.toString();
+        }
+        return JSON_CODEC.toJson(toJsonCompatibleValue(value));
+    }
+
+    private static Object toJsonCompatibleValue(Object value)
+    {
+        if (value == null ||
+                value instanceof Boolean ||
+                value instanceof Number ||
+                value instanceof CharSequence) {
+            return value;
+        }
+        if (value instanceof Slice slice) {
+            return slice.toStringUtf8();
+        }
+        if (value instanceof Map<?, ?> map) {
+            return map.entrySet().stream()
+                    .collect(java.util.stream.Collectors.toMap(
+                            entry -> entry.getKey().toString(),
+                            entry -> toJsonCompatibleValue(entry.getValue())));
+        }
+        if (value instanceof Iterable<?> iterable) {
+            java.util.ArrayList<Object> values = new java.util.ArrayList<>();
+            for (Object element : iterable) {
+                values.add(toJsonCompatibleValue(element));
+            }
+            return values;
+        }
+        return value.toString();
     }
 
     private static String readTextValue(FieldVector vector, int index)

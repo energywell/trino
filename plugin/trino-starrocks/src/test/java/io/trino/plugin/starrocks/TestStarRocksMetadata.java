@@ -19,6 +19,7 @@ import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.SchemaTablePrefix;
+import io.trino.spi.type.TypeSignature;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -29,9 +30,11 @@ import java.util.stream.Collectors;
 
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.DecimalType.createDecimalType;
+import static io.trino.spi.type.StandardTypes.JSON;
 import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.testing.TestingConnectorSession.SESSION;
+import static io.trino.type.InternalTypeManager.TESTING_TYPE_MANAGER;
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class TestStarRocksMetadata
@@ -79,6 +82,7 @@ final class TestStarRocksMetadata
 
     private static final StarRocksRemoteTable EVENTS = new StarRocksRemoteTable(
             new SchemaTableName("analytics", "events"),
+            Optional.empty(),
             "analytics",
             "events",
             StarRocksRelationType.TABLE,
@@ -89,6 +93,7 @@ final class TestStarRocksMetadata
 
     private static final StarRocksRemoteTable METRICS_VIEW = new StarRocksRemoteTable(
             new SchemaTableName("analytics", "metrics_view"),
+            Optional.empty(),
             "Analytics",
             "MetricsView",
             StarRocksRelationType.VIEW,
@@ -99,7 +104,7 @@ final class TestStarRocksMetadata
 
     private final StarRocksMetadata metadata = new StarRocksMetadata(
             new TestingStarRocksMetadataClient(List.of(EVENTS, METRICS_VIEW)),
-            new StarRocksTypeMapper());
+            new StarRocksTypeMapper(TESTING_TYPE_MANAGER));
 
     @Test
     void testListSchemaNamesAndTables()
@@ -114,7 +119,7 @@ final class TestStarRocksMetadata
     {
         StarRocksTableHandle tableHandle = (StarRocksTableHandle) metadata.getTableHandle(SESSION, EVENTS.schemaTableName(), Optional.empty(), Optional.empty());
 
-        assertThat(tableHandle).isEqualTo(new StarRocksTableHandle("analytics", "events", "analytics", "events", StarRocksRelationType.TABLE));
+        assertThat(tableHandle).isEqualTo(new StarRocksTableHandle("analytics", "events", Optional.empty(), "analytics", "events", StarRocksRelationType.TABLE));
         assertThat(metadata.getTableHandle(SESSION, new SchemaTableName("analytics", "missing"), Optional.empty(), Optional.empty())).isNull();
 
         ConnectorTableMetadata tableMetadata = metadata.getTableMetadata(SESSION, tableHandle);
@@ -122,7 +127,7 @@ final class TestStarRocksMetadata
         assertThat(tableMetadata.getColumns()).isEqualTo(List.of(
                 new ColumnMetadata("event_id", BIGINT),
                 new ColumnMetadata("created_at", createTimestampType(3)),
-                new ColumnMetadata("payload", createUnboundedVarcharType())));
+                new ColumnMetadata("payload", TESTING_TYPE_MANAGER.getType(new TypeSignature(JSON)))));
     }
 
     @Test
@@ -138,7 +143,7 @@ final class TestStarRocksMetadata
     @Test
     void testColumnHandlesAndTableColumns()
     {
-        Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(SESSION, new StarRocksTableHandle("analytics", "metrics_view", "Analytics", "MetricsView", StarRocksRelationType.VIEW));
+        Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(SESSION, new StarRocksTableHandle("analytics", "metrics_view", Optional.empty(), "Analytics", "MetricsView", StarRocksRelationType.VIEW));
 
         assertThat(columnHandles).isEqualTo(Map.of(
                 "metric_key", new StarRocksColumnHandle("metric_key", "metric_key", BIGINT, 0),
@@ -151,7 +156,7 @@ final class TestStarRocksMetadata
                 List.of(
                         new ColumnMetadata("event_id", BIGINT),
                         new ColumnMetadata("created_at", createTimestampType(3)),
-                        new ColumnMetadata("payload", createUnboundedVarcharType())),
+                        new ColumnMetadata("payload", TESTING_TYPE_MANAGER.getType(new TypeSignature(JSON)))),
                 METRICS_VIEW.schemaTableName(),
                 List.of(
                         new ColumnMetadata("metric_key", BIGINT),
@@ -162,7 +167,7 @@ final class TestStarRocksMetadata
     @Test
     void testTableStatisticsUsesRemoteRowCount()
     {
-        assertThat(metadata.getTableStatistics(SESSION, new StarRocksTableHandle("analytics", "events", "analytics", "events", StarRocksRelationType.TABLE)).getRowCount().getValue())
+        assertThat(metadata.getTableStatistics(SESSION, new StarRocksTableHandle("analytics", "events", Optional.empty(), "analytics", "events", StarRocksRelationType.TABLE)).getRowCount().getValue())
                 .isEqualTo(42.0);
     }
 }

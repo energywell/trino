@@ -15,28 +15,86 @@ package io.trino.plugin.starrocks;
 
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.TupleDomain;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalLong;
 
 import static java.util.Objects.requireNonNull;
 
 public record StarRocksTableHandle(
         String schemaName,
         String tableName,
+        Optional<String> remoteCatalogName,
         String remoteSchemaName,
         String remoteTableName,
-        StarRocksRelationType relationType)
+        StarRocksRelationType relationType,
+        TupleDomain<StarRocksColumnHandle> constraint,
+        OptionalLong limit,
+        List<StarRocksSortItem> sortOrder,
+        Optional<StarRocksAggregation> aggregation)
         implements ConnectorTableHandle
 {
+    public StarRocksTableHandle(
+            String schemaName,
+            String tableName,
+            Optional<String> remoteCatalogName,
+            String remoteSchemaName,
+            String remoteTableName,
+            StarRocksRelationType relationType)
+    {
+        this(
+                schemaName,
+                tableName,
+                remoteCatalogName,
+                remoteSchemaName,
+                remoteTableName,
+                relationType,
+                TupleDomain.all(),
+                OptionalLong.empty(),
+                List.of(),
+                Optional.empty());
+    }
+
     public StarRocksTableHandle
     {
         requireNonNull(schemaName, "schemaName is null");
         requireNonNull(tableName, "tableName is null");
+        requireNonNull(remoteCatalogName, "remoteCatalogName is null");
         requireNonNull(remoteSchemaName, "remoteSchemaName is null");
         requireNonNull(remoteTableName, "remoteTableName is null");
         requireNonNull(relationType, "relationType is null");
+        requireNonNull(constraint, "constraint is null");
+        requireNonNull(limit, "limit is null");
+        sortOrder = List.copyOf(requireNonNull(sortOrder, "sortOrder is null"));
+        requireNonNull(aggregation, "aggregation is null");
     }
 
     public SchemaTableName toSchemaTableName()
     {
         return new SchemaTableName(schemaName, tableName);
+    }
+
+    public StarRocksTableHandle withConstraint(TupleDomain<StarRocksColumnHandle> constraint)
+    {
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, limit, sortOrder, aggregation);
+    }
+
+    public StarRocksTableHandle withLimit(long limit)
+    {
+        OptionalLong newLimit = this.limit.isPresent() ? OptionalLong.of(Math.min(this.limit.getAsLong(), limit)) : OptionalLong.of(limit);
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, newLimit, sortOrder, aggregation);
+    }
+
+    public StarRocksTableHandle withTopN(long limit, List<StarRocksSortItem> sortOrder)
+    {
+        OptionalLong newLimit = this.limit.isPresent() ? OptionalLong.of(Math.min(this.limit.getAsLong(), limit)) : OptionalLong.of(limit);
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, newLimit, sortOrder, aggregation);
+    }
+
+    public StarRocksTableHandle withAggregation(StarRocksAggregation aggregation)
+    {
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, OptionalLong.empty(), List.of(), Optional.of(aggregation));
     }
 }

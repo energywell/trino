@@ -80,6 +80,10 @@ The configuration properties are:
 * - `starrocks.jdbc-url`
   - Yes
   - StarRocks JDBC URL used for metadata discovery.
+* - `starrocks.catalog-name`
+  - No
+  - StarRocks catalog to expose through this Trino catalog. When set, Trino
+    schemas map to databases inside the configured StarRocks catalog.
 * - `starrocks.username`
   - No
   - StarRocks username used for JDBC metadata access and Flight SQL sessions.
@@ -105,6 +109,8 @@ The StarRocks connector exposes StarRocks metadata through Trino's lowercase
 identifier model.
 
 - Each StarRocks database appears as a Trino schema.
+- If `starrocks.catalog-name` is configured, each database in that StarRocks
+  catalog appears as a Trino schema.
 - `SHOW SCHEMAS` excludes internal schemas such as `information_schema`,
   `_statistics_`, and `sys`.
 - `SHOW TABLES` lists readable base tables and views.
@@ -171,11 +177,13 @@ The connector maps StarRocks types to Trino types conservatively.
 * - `BINARY`, `VARBINARY`
   - `VARBINARY`
   -
-* - `STRING`, `TEXT`, `JSON`
+* - `JSON`, `VARIANT`
+  - `JSON`
+  - Values are read through the Arrow Flight SQL path as JSON text.
+* - `STRING`, `TEXT`
   - `VARCHAR`
   - These values are read textually in v1.
-* - `LARGEINT`, `BITMAP`, `HLL`, `PERCENTILE`, `ARRAY`, `MAP`, `STRUCT`,
-    `VARIANT`
+* - `LARGEINT`, `BITMAP`, `HLL`, `PERCENTILE`, `ARRAY`, `MAP`, `STRUCT`
   - `VARCHAR`
   - These types are preserved for metadata visibility and mapped
     conservatively in v1.
@@ -200,13 +208,17 @@ SELECT id, created_at, name FROM example.analytics.events ORDER BY id;
 SELECT * FROM example.analytics.events_view;
 ```
 
+The connector pushes down basic predicates, `LIMIT`, `ORDER BY ... LIMIT`, and
+`count` aggregations into the SQL submitted through Arrow Flight SQL.
+
 ## Limitations
 
 The initial version of the connector intentionally does not support:
 
 - `INSERT`, `UPDATE`, `DELETE`, or `MERGE`
 - table creation, schema creation, or other write-path DDL
-- StarRocks-specific type fidelity for every complex type
+- native Trino `ARRAY`, `MAP`, or `ROW` decoding for StarRocks complex types
+- aggregations other than `count`
 - advanced split planning beyond the FE Arrow Flight SQL path
 
 The connector prioritizes correct metadata discovery and stable read behavior
