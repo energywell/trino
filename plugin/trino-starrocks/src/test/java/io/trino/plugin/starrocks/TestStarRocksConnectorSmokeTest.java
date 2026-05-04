@@ -84,6 +84,7 @@ final class TestStarRocksConnectorSmokeTest
     {
         return switch (connectorBehavior) {
             case SUPPORTS_TOPN_PUSHDOWN_WITH_VARCHAR -> true;
+            case SUPPORTS_AGGREGATION_PUSHDOWN -> true;
             case SUPPORTS_ADD_COLUMN,
                     SUPPORTS_ARRAY,
                     SUPPORTS_COMMENT_ON_COLUMN,
@@ -106,7 +107,6 @@ final class TestStarRocksConnectorSmokeTest
                     SUPPORTS_RENAME_TABLE,
                     SUPPORTS_ROW_TYPE,
                     SUPPORTS_SET_COLUMN_TYPE,
-                    SUPPORTS_AGGREGATION_PUSHDOWN,
                     SUPPORTS_AGGREGATION_PUSHDOWN_COUNT_DISTINCT,
                     SUPPORTS_UPDATE,
                     SUPPORTS_AGGREGATION_PUSHDOWN_CORRELATION,
@@ -200,7 +200,23 @@ final class TestStarRocksConnectorSmokeTest
         TestingStarRocksEnvironment.Request countRequest = environment.getLastRequest().orElseThrow();
         assertThat(countRequest.tableHandle().constraint().isAll()).isFalse();
         assertThat(countRequest.tableHandle().aggregation()).isPresent();
+        assertThat(countRequest.tableHandle().projectedColumns()).isPresent();
+        assertThat(countRequest.tableHandle().projectedColumns().orElseThrow()).extracting(StarRocksColumnHandle::columnName)
+                .containsExactly("_starrocks_agg_0");
         assertThat(countRequest.requestedColumns()).extracting(StarRocksColumnHandle::columnName)
                 .containsExactly("_starrocks_agg_0");
+    }
+
+    @Test
+    void testStarRocksAggregationPushdowns()
+    {
+        assertQuery(
+                "SELECT sum(id), avg(id), min(name), max(created_at) FROM starrocks.starrocks_test.events WHERE id >= 2",
+                "VALUES (5, 2.5, 'beta', TIMESTAMP '2024-01-03 12:17:32.500')");
+        TestingStarRocksEnvironment.Request aggregateRequest = environment.getLastRequest().orElseThrow();
+        assertThat(aggregateRequest.tableHandle().aggregation()).isPresent();
+        assertThat(aggregateRequest.tableHandle().aggregation().orElseThrow().aggregateColumns())
+                .extracting(StarRocksAggregateColumn::expression)
+                .containsExactly("sum(`id`)", "avg(`id`)", "min(`name`)", "max(`created_at`)");
     }
 }

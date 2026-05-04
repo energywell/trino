@@ -15,6 +15,7 @@ package io.trino.plugin.starrocks;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.File;
 import java.util.Map;
 
 import static io.airlift.configuration.testing.ConfigAssertions.assertFullMapping;
@@ -32,7 +33,11 @@ final class TestStarRocksConfig
                 .setUsername(null)
                 .setPassword(null)
                 .setFlightSqlHost(null)
-                .setFlightSqlPort(9408));
+                .setFlightSqlPort(9408)
+                .setFlightSqlTlsEnabled(false)
+                .setFlightSqlTlsRootCertificate(null)
+                .setFlightSqlTlsSkipVerify(false)
+                .setFlightSqlTlsOverrideHostname(null));
     }
 
     @Test
@@ -44,7 +49,11 @@ final class TestStarRocksConfig
                 Map.entry("starrocks.username", "trino"),
                 Map.entry("starrocks.password", "secret"),
                 Map.entry("starrocks.flight-sql-host", "flight.example.net"),
-                Map.entry("starrocks.flight-sql-port", "9500"));
+                Map.entry("starrocks.flight-sql-port", "9500"),
+                Map.entry("starrocks.flight-sql.tls.enabled", "true"),
+                Map.entry("starrocks.flight-sql.tls.root-certificate", "/etc/trino/starrocks-ca.pem"),
+                Map.entry("starrocks.flight-sql.tls.skip-verify", "true"),
+                Map.entry("starrocks.flight-sql.tls.override-hostname", "fe.internal.example.net"));
 
         StarRocksConfig expected = new StarRocksConfig()
                 .setJdbcUrl("jdbc:starrocks://fe.example.net:9030")
@@ -52,7 +61,11 @@ final class TestStarRocksConfig
                 .setUsername("trino")
                 .setPassword("secret")
                 .setFlightSqlHost("flight.example.net")
-                .setFlightSqlPort(9500);
+                .setFlightSqlPort(9500)
+                .setFlightSqlTlsEnabled(true)
+                .setFlightSqlTlsRootCertificate(new File("/etc/trino/starrocks-ca.pem"))
+                .setFlightSqlTlsSkipVerify(true)
+                .setFlightSqlTlsOverrideHostname("fe.internal.example.net");
 
         assertFullMapping(properties, expected);
     }

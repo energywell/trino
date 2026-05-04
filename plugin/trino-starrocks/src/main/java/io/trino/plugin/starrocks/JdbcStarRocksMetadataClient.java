@@ -54,7 +54,7 @@ public class JdbcStarRocksMetadataClient
             SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
             FROM INFORMATION_SCHEMA.TABLES
             WHERE LOWER(TABLE_SCHEMA) NOT IN ('information_schema', '_statistics_', 'sys')
-              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+              AND UPPER(TABLE_TYPE) IN ('TABLE', 'BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
     private static final String LIST_ALL_TABLES_IN_CATALOG_SQL = """
@@ -62,14 +62,14 @@ public class JdbcStarRocksMetadataClient
             FROM INFORMATION_SCHEMA.TABLES
             WHERE TABLE_CATALOG = ?
               AND LOWER(TABLE_SCHEMA) NOT IN ('information_schema', '_statistics_', 'sys')
-              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+              AND UPPER(TABLE_TYPE) IN ('TABLE', 'BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
     private static final String LIST_TABLES_IN_SCHEMA_SQL = """
             SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
             FROM INFORMATION_SCHEMA.TABLES
             WHERE LOWER(TABLE_SCHEMA) = LOWER(?)
-              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+              AND UPPER(TABLE_TYPE) IN ('TABLE', 'BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
     private static final String LIST_TABLES_IN_CATALOG_SCHEMA_SQL = """
@@ -77,7 +77,7 @@ public class JdbcStarRocksMetadataClient
             FROM INFORMATION_SCHEMA.TABLES
             WHERE TABLE_CATALOG = ?
               AND LOWER(TABLE_SCHEMA) = LOWER(?)
-              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+              AND UPPER(TABLE_TYPE) IN ('TABLE', 'BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
     private static final String RESOLVE_TABLE_SQL = """
@@ -85,7 +85,7 @@ public class JdbcStarRocksMetadataClient
             FROM INFORMATION_SCHEMA.TABLES
             WHERE LOWER(TABLE_SCHEMA) = LOWER(?)
               AND LOWER(TABLE_NAME) = LOWER(?)
-              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+              AND UPPER(TABLE_TYPE) IN ('TABLE', 'BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
     private static final String RESOLVE_TABLE_IN_CATALOG_SQL = """
@@ -94,7 +94,7 @@ public class JdbcStarRocksMetadataClient
             WHERE TABLE_CATALOG = ?
               AND LOWER(TABLE_SCHEMA) = LOWER(?)
               AND LOWER(TABLE_NAME) = LOWER(?)
-              AND UPPER(TABLE_TYPE) IN ('BASE TABLE', 'VIEW')
+              AND UPPER(TABLE_TYPE) IN ('TABLE', 'BASE TABLE', 'VIEW')
             ORDER BY TABLE_SCHEMA, TABLE_NAME
             """;
     private static final String LIST_COLUMNS_SQL = """
@@ -121,6 +121,19 @@ public class JdbcStarRocksMetadataClient
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_CATALOG = ?
               AND LOWER(TABLE_SCHEMA) = LOWER(?)
+              AND LOWER(TABLE_NAME) = LOWER(?)
+            ORDER BY ORDINAL_POSITION
+            """;
+    private static final String LIST_COLUMNS_WITHOUT_CATALOG_SQL = """
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                COLUMN_TYPE,
+                COALESCE(CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION) AS COLUMN_SIZE,
+                COALESCE(NUMERIC_SCALE, DATETIME_PRECISION) AS DECIMAL_DIGITS,
+                ORDINAL_POSITION
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE LOWER(TABLE_SCHEMA) = LOWER(?)
               AND LOWER(TABLE_NAME) = LOWER(?)
             ORDER BY ORDINAL_POSITION
             """;
@@ -398,6 +411,12 @@ public class JdbcStarRocksMetadataClient
             if (!columns.isEmpty()) {
                 return columns;
             }
+            if (catalogName.isPresent()) {
+                columns = loadColumnsFromInformationSchemaWithoutCatalog(session, resolvedTable);
+                if (!columns.isEmpty()) {
+                    return columns;
+                }
+            }
         }
         catch (SQLException e) {
             informationSchemaFailure = e;
@@ -442,6 +461,17 @@ public class JdbcStarRocksMetadataClient
         }
     }
 
+    private List<StarRocksRemoteColumn> loadColumnsFromInformationSchemaWithoutCatalog(ConnectorSession session, ResolvedTable resolvedTable)
+            throws SQLException
+    {
+        try (Connection connection = openConnection(session);
+                PreparedStatement statement = connection.prepareStatement(LIST_COLUMNS_WITHOUT_CATALOG_SQL)) {
+            statement.setString(1, resolvedTable.remoteSchemaName());
+            statement.setString(2, resolvedTable.remoteTableName());
+            return readColumns(statement);
+        }
+    }
+
     private List<StarRocksRemoteColumn> loadColumnsFromInformationSchema(ConnectorSession session, ResolvedTable resolvedTable)
             throws SQLException
     {
@@ -455,21 +485,27 @@ public class JdbcStarRocksMetadataClient
             statement.setString(index++, resolvedTable.remoteSchemaName());
             statement.setString(index, resolvedTable.remoteTableName());
 
-            try (ResultSet resultSet = statement.executeQuery()) {
-                List<StarRocksRemoteColumn> columns = new ArrayList<>();
-                while (resultSet.next()) {
-                    String remoteColumnName = resultSet.getString("COLUMN_NAME");
-                    columns.add(new StarRocksRemoteColumn(
-                            lowercaseName(remoteColumnName),
-                            remoteColumnName,
-                            resultSet.getString("DATA_TYPE"),
-                            getOptionalInt(resultSet, "COLUMN_SIZE"),
-                            getOptionalInt(resultSet, "DECIMAL_DIGITS"),
-                            resultSet.getInt("ORDINAL_POSITION"),
-                            Optional.ofNullable(resultSet.getString("COLUMN_TYPE"))));
-                }
-                return deduplicateColumns(columns);
+            return readColumns(statement);
+        }
+    }
+
+    private static List<StarRocksRemoteColumn> readColumns(PreparedStatement statement)
+            throws SQLException
+    {
+        try (ResultSet resultSet = statement.executeQuery()) {
+            List<StarRocksRemoteColumn> columns = new ArrayList<>();
+            while (resultSet.next()) {
+                String remoteColumnName = resultSet.getString("COLUMN_NAME");
+                columns.add(new StarRocksRemoteColumn(
+                        lowercaseName(remoteColumnName),
+                        remoteColumnName,
+                        resultSet.getString("DATA_TYPE"),
+                        getOptionalInt(resultSet, "COLUMN_SIZE"),
+                        getOptionalInt(resultSet, "DECIMAL_DIGITS"),
+                        resultSet.getInt("ORDINAL_POSITION"),
+                        Optional.ofNullable(resultSet.getString("COLUMN_TYPE"))));
             }
+            return deduplicateColumns(columns);
         }
     }
 

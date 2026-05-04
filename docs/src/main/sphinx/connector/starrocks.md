@@ -97,6 +97,20 @@ The configuration properties are:
 * - `starrocks.flight-sql-port`
   - No
   - FE Arrow Flight SQL port used for reads. The default is `9408`.
+* - `starrocks.flight-sql.tls.enabled`
+  - No
+  - Use TLS for Arrow Flight SQL connections. The default is `false`.
+* - `starrocks.flight-sql.tls.root-certificate`
+  - No
+  - Path to a PEM root certificate file for Arrow Flight SQL TLS.
+* - `starrocks.flight-sql.tls.skip-verify`
+  - No
+  - Skip Arrow Flight SQL server certificate verification. Use only for
+    development or controlled validation environments.
+* - `starrocks.flight-sql.tls.override-hostname`
+  - No
+  - Hostname used for Arrow Flight SQL TLS verification when it differs from
+    `starrocks.flight-sql-host`.
 :::
 
 If you create multiple catalog properties files, Trino creates one StarRocks
@@ -180,13 +194,24 @@ The connector maps StarRocks types to Trino types conservatively.
 * - `JSON`, `VARIANT`
   - `JSON`
   - Values are read through the Arrow Flight SQL path as JSON text.
+* - `ARRAY<T>`
+  - `ARRAY<T>`
+  - Supported when StarRocks exposes a parseable nested type declaration and
+    Flight SQL returns either Arrow-native nested values or JSON text.
+* - `MAP<K,V>`
+  - `MAP<K,V>`
+  - Supported when the key type maps to a comparable Trino type.
+* - `STRUCT<...>`
+  - `ROW(...)`
+  - Supported when StarRocks exposes field names and parseable field types.
 * - `STRING`, `TEXT`
   - `VARCHAR`
   - These values are read textually in v1.
-* - `LARGEINT`, `BITMAP`, `HLL`, `PERCENTILE`, `ARRAY`, `MAP`, `STRUCT`
+* - `LARGEINT`, `BITMAP`, `HLL`, `PERCENTILE`
   - `VARCHAR`
   - These types are preserved for metadata visibility and mapped
-    conservatively in v1.
+    conservatively because Trino does not have equivalent native semantics for
+    the full StarRocks value domain.
 :::
 
 ## Querying StarRocks
@@ -209,7 +234,11 @@ SELECT * FROM example.analytics.events_view;
 ```
 
 The connector pushes down basic predicates, `LIMIT`, `ORDER BY ... LIMIT`, and
-`count` aggregations into the SQL submitted through Arrow Flight SQL.
+basic aggregations into the SQL submitted through Arrow Flight SQL.
+
+Aggregation pushdown supports `count`, `sum`, `avg`, `min`, and `max` when the
+aggregation has no `DISTINCT`, `FILTER`, or aggregate-local `ORDER BY` clause.
+Unsupported aggregation forms are evaluated end-to-end by Trino.
 
 ## Limitations
 
@@ -217,9 +246,13 @@ The initial version of the connector intentionally does not support:
 
 - `INSERT`, `UPDATE`, `DELETE`, or `MERGE`
 - table creation, schema creation, or other write-path DDL
-- native Trino `ARRAY`, `MAP`, or `ROW` decoding for StarRocks complex types
-- aggregations other than `count`
-- advanced split planning beyond the FE Arrow Flight SQL path
+- DDL or write-path support for StarRocks complex types
+- native complex-type decoding when StarRocks does not expose a parseable
+  nested type declaration or Flight SQL returns non-JSON textual values
+- `DISTINCT`, filtered, sorted, statistical, regression, or approximate
+  aggregation pushdown
+- connector-specific split planning outside the partitions returned by Arrow
+  Flight SQL
 
 The connector prioritizes correct metadata discovery and stable read behavior
 for StarRocks-native deployments.

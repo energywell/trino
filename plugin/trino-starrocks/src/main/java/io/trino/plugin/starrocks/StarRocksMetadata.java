@@ -28,6 +28,7 @@ import io.trino.spi.connector.ConnectorTableVersion;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
 import io.trino.spi.connector.LimitApplicationResult;
+import io.trino.spi.connector.ProjectionApplicationResult;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.connector.SchemaTablePrefix;
 import io.trino.spi.connector.SortItem;
@@ -40,16 +41,26 @@ import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.statistics.Estimate;
 import io.trino.spi.statistics.TableStatistics;
+import io.trino.spi.type.DecimalType;
+import io.trino.spi.type.Type;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
+import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.DoubleType.DOUBLE;
+import static io.trino.spi.type.IntegerType.INTEGER;
+import static io.trino.spi.type.RealType.REAL;
+import static io.trino.spi.type.SmallintType.SMALLINT;
+import static io.trino.spi.type.TinyintType.TINYINT;
 import static java.util.Objects.requireNonNull;
 
 public class StarRocksMetadata
@@ -238,6 +249,36 @@ public class StarRocksMetadata
     }
 
     @Override
+    public Optional<ProjectionApplicationResult<ConnectorTableHandle>> applyProjection(
+            ConnectorSession session,
+            ConnectorTableHandle table,
+            List<ConnectorExpression> projections,
+            Map<String, ColumnHandle> assignments)
+    {
+        StarRocksTableHandle handle = (StarRocksTableHandle) table;
+
+        List<StarRocksColumnHandle> projectedColumns = new ArrayList<>(assignments.size());
+        List<Assignment> resultAssignments = new ArrayList<>(assignments.size());
+        for (Map.Entry<String, ColumnHandle> entry : assignments.entrySet()) {
+            if (!(entry.getValue() instanceof StarRocksColumnHandle columnHandle)) {
+                return Optional.empty();
+            }
+            projectedColumns.add(columnHandle);
+            resultAssignments.add(new Assignment(entry.getKey(), columnHandle, columnHandle.columnType()));
+        }
+
+        if (handle.projectedColumns().isPresent() && containSameElements(handle.projectedColumns().orElseThrow(), projectedColumns)) {
+            return Optional.empty();
+        }
+
+        return Optional.of(new ProjectionApplicationResult<>(
+                handle.withProjectedColumns(projectedColumns),
+                projections,
+                resultAssignments,
+                false));
+    }
+
+    @Override
     public Optional<AggregationApplicationResult<ConnectorTableHandle>> applyAggregation(
             ConnectorSession session,
             ConnectorTableHandle table,
@@ -339,12 +380,42 @@ public class StarRocksMetadata
 
     private static Optional<String> toAggregationExpression(AggregateFunction aggregate, Map<String, ColumnHandle> assignments)
     {
-        if (!aggregate.getFunctionName().equals("count") ||
-                aggregate.isDistinct() ||
+        if (aggregate.isDistinct() ||
                 aggregate.getFilter().isPresent() ||
                 !aggregate.getSortItems().isEmpty()) {
             return Optional.empty();
         }
+        String functionName = aggregate.getFunctionName().toLowerCase(Locale.ENGLISH);
+        if (functionName.equals("count")) {
+            return toCountAggregationExpression(aggregate, assignments);
+        }
+        if (!List.of("avg", "max", "min", "sum").contains(functionName)) {
+            return Optional.empty();
+        }
+        if (aggregate.getArguments().size() != 1) {
+            return Optional.empty();
+        }
+
+        ConnectorExpression argument = aggregate.getArguments().getFirst();
+        if (!(argument instanceof Variable variable)) {
+            return Optional.empty();
+        }
+        ColumnHandle columnHandle = assignments.get(variable.getName());
+        if (!(columnHandle instanceof StarRocksColumnHandle starRocksColumnHandle)) {
+            return Optional.empty();
+        }
+        if (List.of("avg", "sum").contains(functionName) && !isNumericAggregationSupported(starRocksColumnHandle.columnType())) {
+            return Optional.empty();
+        }
+        if (List.of("max", "min").contains(functionName) && !starRocksColumnHandle.columnType().isOrderable()) {
+            return Optional.empty();
+        }
+
+        return Optional.of(functionName + "(" + StarRocksQueryBuilder.quoteIdentifier(starRocksColumnHandle.remoteColumnName()) + ")");
+    }
+
+    private static Optional<String> toCountAggregationExpression(AggregateFunction aggregate, Map<String, ColumnHandle> assignments)
+    {
         if (aggregate.getArguments().isEmpty()) {
             return Optional.of("count(*)");
         }
@@ -367,6 +438,22 @@ public class StarRocksMetadata
             return Optional.of("count(*)");
         }
         return Optional.empty();
+    }
+
+    private static boolean isNumericAggregationSupported(Type type)
+    {
+        return type == TINYINT ||
+                type == SMALLINT ||
+                type == INTEGER ||
+                type == BIGINT ||
+                type == REAL ||
+                type == DOUBLE ||
+                type instanceof DecimalType;
+    }
+
+    private static boolean containSameElements(List<StarRocksColumnHandle> left, List<StarRocksColumnHandle> right)
+    {
+        return left.size() == right.size() && new HashSet<>(left).equals(new HashSet<>(right));
     }
 
     private List<SchemaTableName> listTables(ConnectorSession session, SchemaTablePrefix prefix)

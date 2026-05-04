@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.starrocks;
 
+import com.google.inject.Inject;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorSplitManager;
 import io.trino.spi.connector.ConnectorSplitSource;
@@ -24,9 +25,19 @@ import io.trino.spi.connector.FixedSplitSource;
 
 import java.util.List;
 
+import static java.util.Objects.requireNonNull;
+
 public class StarRocksSplitManager
         implements ConnectorSplitManager
 {
+    private final StarRocksFlightSqlClient flightSqlClient;
+
+    @Inject
+    public StarRocksSplitManager(StarRocksFlightSqlClient flightSqlClient)
+    {
+        this.flightSqlClient = requireNonNull(flightSqlClient, "flightSqlClient is null");
+    }
+
     @Override
     public ConnectorSplitSource getSplits(
             ConnectorTransactionHandle transactionHandle,
@@ -35,6 +46,10 @@ public class StarRocksSplitManager
             DynamicFilter dynamicFilter,
             Constraint constraint)
     {
-        return new FixedSplitSource(List.of(new StarRocksSplit()));
+        StarRocksTableHandle starRocksTable = (StarRocksTableHandle) tableHandle;
+        if (starRocksTable.projectedColumns().isEmpty()) {
+            return new FixedSplitSource(List.of(new StarRocksSplit()));
+        }
+        return new FixedSplitSource(flightSqlClient.getSplits(session, starRocksTable, starRocksTable.projectedColumns().orElseThrow()));
     }
 }

@@ -49,8 +49,10 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoField;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -81,6 +83,7 @@ import static io.trino.spi.type.VarbinaryType.VARBINARY;
 import static java.lang.Float.floatToRawIntBits;
 import static java.lang.Math.toIntExact;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.time.ZoneOffset.UTC;
 import static java.util.Objects.requireNonNull;
 
 final class TestingStarRocksEnvironment
@@ -310,6 +313,12 @@ final class TestingStarRocksEnvironment
         }
 
         @Override
+        public List<StarRocksSplit> getSplits(ConnectorSession session, StarRocksTableHandle tableHandle, List<StarRocksColumnHandle> columns)
+        {
+            return List.of(new StarRocksSplit());
+        }
+
+        @Override
         public StarRocksFlightSqlResult openStream(ConnectorSession session, StarRocksTableHandle tableHandle, StarRocksSplit split, List<StarRocksColumnHandle> columns)
         {
             lastRequest.set(new Request(tableHandle, columns));
@@ -378,15 +387,16 @@ final class TestingStarRocksEnvironment
                     row.put(aggregation.groupingColumns().get(index).columnName(), group.getKey().get(index));
                 }
                 for (StarRocksAggregateColumn aggregateColumn : aggregation.aggregateColumns()) {
-                    row.put(aggregateColumn.columnName(), evaluateAggregate(aggregateColumn.expression(), group.getValue()));
+                    row.put(aggregateColumn.columnName(), evaluateAggregate(aggregateColumn, group.getValue()));
                 }
                 results.add(Collections.unmodifiableMap(row));
             }
             return List.copyOf(results);
         }
 
-        private static long evaluateAggregate(String expression, List<Map<String, Object>> rows)
+        private static Object evaluateAggregate(StarRocksAggregateColumn aggregateColumn, List<Map<String, Object>> rows)
         {
+            String expression = aggregateColumn.expression();
             String normalized = expression.trim().toLowerCase(Locale.ENGLISH);
             if (normalized.equals("count(*)")) {
                 return rows.size();
@@ -395,12 +405,65 @@ final class TestingStarRocksEnvironment
                 return 0L;
             }
             if (normalized.startsWith("count(`") && normalized.endsWith("`)")) {
-                String columnName = normalized.substring("count(`".length(), normalized.length() - "`)".length()).replace("``", "`");
+                String columnName = quotedAggregationArgument(expression, "count");
                 return rows.stream()
                         .filter(row -> row.get(columnName) != null)
                         .count();
             }
+            if (normalized.startsWith("sum(`") && normalized.endsWith("`)")) {
+                String columnName = quotedAggregationArgument(expression, "sum");
+                BigDecimal sum = rows.stream()
+                        .map(row -> row.get(columnName))
+                        .filter(Objects::nonNull)
+                        .map(TestingStarRocksFlightSqlClient::toBigDecimalValue)
+                        .reduce(BigDecimal.ZERO, BigDecimal::add);
+                if (aggregateColumn.type().getJavaType() == long.class) {
+                    return sum.longValueExact();
+                }
+                if (aggregateColumn.type().getJavaType() == double.class) {
+                    return sum.doubleValue();
+                }
+                return sum;
+            }
+            if (normalized.startsWith("avg(`") && normalized.endsWith("`)")) {
+                String columnName = quotedAggregationArgument(expression, "avg");
+                List<BigDecimal> values = rows.stream()
+                        .map(row -> row.get(columnName))
+                        .filter(Objects::nonNull)
+                        .map(TestingStarRocksFlightSqlClient::toBigDecimalValue)
+                        .toList();
+                if (values.isEmpty()) {
+                    return null;
+                }
+                BigDecimal sum = values.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
+                BigDecimal average = sum.divide(BigDecimal.valueOf(values.size()), 12, RoundingMode.HALF_UP);
+                if (aggregateColumn.type().getJavaType() == double.class) {
+                    return average.doubleValue();
+                }
+                return average;
+            }
+            if ((normalized.startsWith("min(`") || normalized.startsWith("max(`")) && normalized.endsWith("`)")) {
+                String functionName = normalized.startsWith("min(`") ? "min" : "max";
+                String columnName = quotedAggregationArgument(expression, functionName);
+                Comparator<Object> comparator = Comparator.comparing(TestingStarRocksFlightSqlClient::toComparableValue, TestingStarRocksFlightSqlClient::compareComparableValues);
+                return rows.stream()
+                        .map(row -> row.get(columnName))
+                        .filter(Objects::nonNull)
+                        .min(functionName.equals("min") ? comparator : comparator.reversed())
+                        .orElse(null);
+            }
             throw new IllegalArgumentException("Unsupported testing aggregate expression: " + expression);
+        }
+
+        private static String quotedAggregationArgument(String expression, String functionName)
+        {
+            return expression.substring((functionName + "(`").length(), expression.length() - "`)".length()).replace("``", "`");
+        }
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private static int compareComparableValues(Object left, Object right)
+        {
+            return ((Comparable) left).compareTo(right);
         }
 
         private static List<Map<String, Object>> applySort(List<StarRocksSortItem> sortOrder, List<Map<String, Object>> rows)
@@ -488,11 +551,11 @@ final class TestingStarRocksEnvironment
         private static long toTimestampMicros(Object value)
         {
             if (value instanceof LocalDateTime dateTime) {
-                return dateTime.toEpochSecond(java.time.ZoneOffset.UTC) * MICROSECONDS_PER_SECOND + (dateTime.getNano() / 1_000);
+                return dateTime.toEpochSecond(UTC) * MICROSECONDS_PER_SECOND + dateTime.getLong(ChronoField.MICRO_OF_SECOND);
             }
             String text = value.toString().trim().replace(' ', 'T');
             LocalDateTime dateTime = LocalDateTime.parse(text);
-            return dateTime.toEpochSecond(java.time.ZoneOffset.UTC) * MICROSECONDS_PER_SECOND + (dateTime.getNano() / 1_000);
+            return dateTime.toEpochSecond(UTC) * MICROSECONDS_PER_SECOND + dateTime.getLong(ChronoField.MICRO_OF_SECOND);
         }
 
         private static StarRocksFlightSqlResult createResult(TestingTable table, List<StarRocksColumnHandle> columns, List<Map<String, Object>> rows)

@@ -18,6 +18,7 @@ import io.airlift.configuration.ConfigDescription;
 import io.airlift.configuration.ConfigSecuritySensitive;
 import jakarta.validation.constraints.Min;
 
+import java.io.File;
 import java.util.Optional;
 
 public class StarRocksConfig
@@ -28,6 +29,10 @@ public class StarRocksConfig
     private String password;
     private String flightSqlHost;
     private int flightSqlPort = 9408;
+    private boolean flightSqlTlsEnabled;
+    private File flightSqlTlsRootCertificate;
+    private boolean flightSqlTlsSkipVerify;
+    private String flightSqlTlsOverrideHostname;
 
     public Optional<String> getJdbcUrl()
     {
@@ -105,6 +110,58 @@ public class StarRocksConfig
     public StarRocksConfig setFlightSqlPort(int flightSqlPort)
     {
         this.flightSqlPort = flightSqlPort;
+        return this;
+    }
+
+    public boolean isFlightSqlTlsEnabled()
+    {
+        return flightSqlTlsEnabled;
+    }
+
+    @Config("starrocks.flight-sql.tls.enabled")
+    @ConfigDescription("Use TLS for Arrow Flight SQL connections")
+    public StarRocksConfig setFlightSqlTlsEnabled(boolean flightSqlTlsEnabled)
+    {
+        this.flightSqlTlsEnabled = flightSqlTlsEnabled;
+        return this;
+    }
+
+    public Optional<File> getFlightSqlTlsRootCertificate()
+    {
+        return Optional.ofNullable(flightSqlTlsRootCertificate);
+    }
+
+    @Config("starrocks.flight-sql.tls.root-certificate")
+    @ConfigDescription("Path to a PEM root certificate file for Arrow Flight SQL TLS")
+    public StarRocksConfig setFlightSqlTlsRootCertificate(File flightSqlTlsRootCertificate)
+    {
+        this.flightSqlTlsRootCertificate = flightSqlTlsRootCertificate;
+        return this;
+    }
+
+    public boolean isFlightSqlTlsSkipVerify()
+    {
+        return flightSqlTlsSkipVerify;
+    }
+
+    @Config("starrocks.flight-sql.tls.skip-verify")
+    @ConfigDescription("Skip Arrow Flight SQL TLS server certificate verification")
+    public StarRocksConfig setFlightSqlTlsSkipVerify(boolean flightSqlTlsSkipVerify)
+    {
+        this.flightSqlTlsSkipVerify = flightSqlTlsSkipVerify;
+        return this;
+    }
+
+    public Optional<String> getFlightSqlTlsOverrideHostname()
+    {
+        return Optional.ofNullable(flightSqlTlsOverrideHostname);
+    }
+
+    @Config("starrocks.flight-sql.tls.override-hostname")
+    @ConfigDescription("Hostname to use for Arrow Flight SQL TLS verification")
+    public StarRocksConfig setFlightSqlTlsOverrideHostname(String flightSqlTlsOverrideHostname)
+    {
+        this.flightSqlTlsOverrideHostname = flightSqlTlsOverrideHostname;
         return this;
     }
 }
