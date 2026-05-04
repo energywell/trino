@@ -15,7 +15,10 @@ package io.trino.plugin.starrocks;
 
 import io.trino.spi.Page;
 import io.trino.spi.PageBuilder;
+import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.DecimalType;
+import io.trino.spi.type.MapType;
+import io.trino.spi.type.RowType;
 import io.trino.spi.type.SqlDecimal;
 import io.trino.spi.type.TimestampType;
 import org.apache.arrow.memory.RootAllocator;
@@ -41,18 +44,23 @@ import java.math.BigInteger;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.CharType.createCharType;
 import static io.trino.spi.type.DateType.DATE;
 import static io.trino.spi.type.DecimalType.createDecimalType;
+import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
+import static io.trino.spi.type.RowType.field;
+import static io.trino.spi.type.RowType.rowType;
 import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.spi.type.VarcharType.createVarcharType;
+import static io.trino.type.InternalTypeManager.TESTING_TYPE_MANAGER;
 import static io.trino.type.JsonType.JSON;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.ZoneOffset.UTC;
@@ -139,6 +147,47 @@ final class TestStarRocksArrowToPageConverter
             assertThat(createCharType(3).getObjectValue(page.getBlock(6), 0)).isEqualTo("xy ");
             assertThat(JSON.getObjectValue(page.getBlock(7), 0)).isEqualTo("{\"a\":1}");
             assertThat(page.getBlock(7).isNull(1)).isTrue();
+        }
+    }
+
+    @Test
+    void testConvertTextualComplexColumns()
+    {
+        ArrayType tagsType = new ArrayType(createUnboundedVarcharType());
+        MapType scoresType = new MapType(createUnboundedVarcharType(), BIGINT, TESTING_TYPE_MANAGER.getTypeOperators());
+        RowType detailsType = rowType(
+                field("a", INTEGER),
+                field("b", createVarcharType(12)),
+                field("c", new ArrayType(BIGINT)));
+        List<StarRocksColumnHandle> columns = List.of(
+                new StarRocksColumnHandle("tags", "tags", tagsType, 0),
+                new StarRocksColumnHandle("scores", "scores", scoresType, 1),
+                new StarRocksColumnHandle("details", "details", detailsType, 2));
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                VarCharVector tags = new VarCharVector("tags", allocator);
+                VarCharVector scores = new VarCharVector("scores", allocator);
+                VarCharVector details = new VarCharVector("details", allocator);
+                VectorSchemaRoot root = new VectorSchemaRoot(List.of(tags, scores, details))) {
+            tags.allocateNew();
+            tags.setSafe(0, "[\"red\",\"blue\"]".getBytes(UTF_8));
+            tags.setValueCount(1);
+
+            scores.allocateNew();
+            scores.setSafe(0, "{\"x\":10,\"y\":20}".getBytes(UTF_8));
+            scores.setValueCount(1);
+
+            details.allocateNew();
+            details.setSafe(0, "{\"a\":7,\"b\":\"ok\",\"c\":[3,4]}".getBytes(UTF_8));
+            details.setValueCount(1);
+
+            root.setRowCount(1);
+
+            Page page = convert(columns, root);
+
+            assertThat(tagsType.getObjectValue(page.getBlock(0), 0)).isEqualTo(List.of("red", "blue"));
+            assertThat(scoresType.getObjectValue(page.getBlock(1), 0)).isEqualTo(Map.of("x", 10L, "y", 20L));
+            assertThat(detailsType.getObjectValue(page.getBlock(2), 0)).isEqualTo(List.of(7, "ok", List.of(3L, 4L)));
         }
     }
 

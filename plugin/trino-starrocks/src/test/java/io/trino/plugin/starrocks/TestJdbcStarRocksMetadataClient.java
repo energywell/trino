@@ -141,7 +141,7 @@ final class TestJdbcStarRocksMetadataClient
                                 "ORDINAL_POSITION", 2)),
                 preparedSql::add,
                 List.of(
-                        List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "BASE TABLE")),
+                        List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "TABLE")),
                         List.of()),
                 boundParameters));
 
@@ -189,6 +189,40 @@ final class TestJdbcStarRocksMetadataClient
         assertThat(preparedSql.get(1)).contains("TABLE_CATALOG = ?");
         assertThat(boundParameters.get(0)).containsExactly("external_catalog", "analytics");
         assertThat(boundParameters.get(1)).containsExactly("external_catalog", "analytics", "events");
+    }
+
+    @Test
+    void testGetTableWithConfiguredCatalogFallsBackWhenColumnsCatalogIsNull()
+    {
+        List<String> preparedSql = new ArrayList<>();
+        List<List<String>> boundParameters = new ArrayList<>();
+        JdbcStarRocksMetadataClient client = metadataClient(
+                connectionFactory(
+                        () -> createResultSet(List.of()),
+                        (_, _, _) -> List.of(),
+                        preparedSql::add,
+                        List.of(
+                                List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "TABLE")),
+                                List.of(),
+                                List.of(row(
+                                        "COLUMN_NAME", "event_id",
+                                        "DATA_TYPE", "BIGINT",
+                                        "COLUMN_TYPE", "bigint",
+                                        "COLUMN_SIZE", 20,
+                                        "DECIMAL_DIGITS", null,
+                                        "ORDINAL_POSITION", 1))),
+                        boundParameters),
+                new StarRocksConfig().setCatalogName("external_catalog"));
+
+        StarRocksRemoteTable table = client.getTable(SESSION, new SchemaTableName("analytics", "events")).orElseThrow();
+
+        assertThat(table.remoteCatalogName()).contains("external_catalog");
+        assertThat(table.columns()).extracting(StarRocksRemoteColumn::columnName)
+                .containsExactly("event_id");
+        assertThat(preparedSql.get(1)).contains("TABLE_CATALOG = ?");
+        assertThat(preparedSql.get(2)).doesNotContain("TABLE_CATALOG = ?");
+        assertThat(boundParameters.get(1)).containsExactly("external_catalog", "analytics", "events");
+        assertThat(boundParameters.get(2)).containsExactly("analytics", "events");
     }
 
     @Test

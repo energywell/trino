@@ -46,6 +46,7 @@ import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.StandardTypes.JSON;
 import static io.trino.spi.type.Timestamps.MICROSECONDS_PER_SECOND;
 import static io.trino.spi.type.TinyintType.TINYINT;
+import static java.time.ZoneOffset.UTC;
 import static java.util.Objects.requireNonNull;
 import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.joining;
@@ -296,7 +297,7 @@ public final class StarRocksQueryBuilder
             long epochSeconds = Math.floorDiv(epochMicros, MICROSECONDS_PER_SECOND);
             long microsOfSecond = Math.floorMod(epochMicros, MICROSECONDS_PER_SECOND);
             LocalDateTime timestamp = Instant.ofEpochSecond(epochSeconds, microsOfSecond * 1_000)
-                    .atZone(java.time.ZoneOffset.UTC)
+                    .atZone(UTC)
                     .toLocalDateTime();
             return "TIMESTAMP " + quoteStringLiteral(timestamp.format(TIMESTAMP_FORMATTER));
         }

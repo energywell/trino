@@ -13,6 +13,8 @@
  */
 package io.trino.plugin.starrocks;
 
+import io.trino.spi.type.ArrayType;
+import io.trino.spi.type.MapType;
 import org.junit.jupiter.api.Test;
 
 import java.util.Optional;
@@ -25,6 +27,8 @@ import static io.trino.spi.type.DecimalType.createDecimalType;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
+import static io.trino.spi.type.RowType.field;
+import static io.trino.spi.type.RowType.rowType;
 import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.StandardTypes.JSON;
 import static io.trino.spi.type.TimestampType.createTimestampType;
@@ -80,8 +84,21 @@ final class TestStarRocksTypeMapper
         assertThat(mapper.toTrinoType(column("variant_payload", "VARIANT", null, null, 2, "variant")).getBaseName()).isEqualTo(JSON);
         assertThat(mapper.toTrinoType(column("large_id", "DECIMAL", null, null, 1, "largeint"))).isEqualTo(createUnboundedVarcharType());
         assertThat(mapper.toTrinoType(column("bitmap_summary", "BITMAP", null, null, 3, "bitmap"))).isEqualTo(createUnboundedVarcharType());
-        assertThat(mapper.toTrinoType(column("details", "STRUCT", null, null, 4, "struct<a:int,b:varchar(12)>"))).isEqualTo(createUnboundedVarcharType());
         assertThat(mapper.toTrinoType(column("mystery", "GEOGRAPHY", null, null, 5))).isEqualTo(createUnboundedVarcharType());
+    }
+
+    @Test
+    void testComplexTypeMappings()
+    {
+        assertThat(mapper.toTrinoType(column("tags", "ARRAY", null, null, 1, "array<varchar(12)>")))
+                .isEqualTo(new ArrayType(createVarcharType(12)));
+        assertThat(mapper.toTrinoType(column("scores", "MAP", null, null, 2, "map<varchar(8),array<int>>")))
+                .isEqualTo(new MapType(createVarcharType(8), new ArrayType(INTEGER), TESTING_TYPE_MANAGER.getTypeOperators()));
+        assertThat(mapper.toTrinoType(column("details", "STRUCT", null, null, 3, "struct<a:int,b:varchar(12),c:array<bigint>>")))
+                .isEqualTo(rowType(
+                        field("a", INTEGER),
+                        field("b", createVarcharType(12)),
+                        field("c", new ArrayType(BIGINT))));
     }
 
     private static StarRocksRemoteColumn column(String name, String type, Integer size, Integer scale, int ordinalPosition)

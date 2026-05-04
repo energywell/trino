@@ -19,6 +19,11 @@ import java.util.List;
 
 public interface StarRocksFlightSqlClient
 {
+    List<StarRocksSplit> getSplits(
+            ConnectorSession session,
+            StarRocksTableHandle tableHandle,
+            List<StarRocksColumnHandle> columns);
+
     StarRocksFlightSqlResult openStream(
             ConnectorSession session,
             StarRocksTableHandle tableHandle,

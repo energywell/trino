@@ -18,11 +18,17 @@ import io.airlift.slice.Slice;
 import io.trino.spi.Page;
 import io.trino.spi.PageBuilder;
 import io.trino.spi.TrinoException;
+import io.trino.spi.block.ArrayBlockBuilder;
 import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.block.MapBlockBuilder;
+import io.trino.spi.block.RowBlockBuilder;
+import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.CharType;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Decimals;
 import io.trino.spi.type.Int128;
+import io.trino.spi.type.MapType;
+import io.trino.spi.type.RowType;
 import io.trino.spi.type.SqlTimestamp;
 import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
@@ -57,6 +63,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -84,6 +91,7 @@ import static java.lang.Math.multiplyExact;
 import static java.math.RoundingMode.UNNECESSARY;
 import static java.time.ZoneOffset.UTC;
 import static java.util.Objects.requireNonNull;
+import static java.util.stream.Collectors.toMap;
 
 public class StarRocksArrowToPageConverter
 {
@@ -146,6 +154,9 @@ public class StarRocksArrowToPageConverter
                 else if (javaType == Int128.class) {
                     writeLongDecimal(output, (DecimalType) type, vector, index);
                 }
+                else if (type instanceof ArrayType || type instanceof MapType || type instanceof RowType) {
+                    writeObjectValue(output, type, readComplexValue(vector, index));
+                }
                 else {
                     throw unsupportedType(type, vector);
                 }
@@ -205,6 +216,108 @@ public class StarRocksArrowToPageConverter
         decimalType.writeObject(output, Decimals.encodeScaledValue(coerceDecimalValue(vector.getName(), readDecimalValue(vector, index), decimalType), decimalType.getScale()));
     }
 
+    private void writeObjectValue(BlockBuilder output, Type type, Object value)
+    {
+        if (value == null) {
+            output.appendNull();
+            return;
+        }
+        if (type instanceof ArrayType arrayType) {
+            writeArrayValue(output, arrayType, value);
+            return;
+        }
+        if (type instanceof MapType mapType) {
+            writeMapValue(output, mapType, value);
+            return;
+        }
+        if (type instanceof RowType rowType) {
+            writeRowValue(output, rowType, value);
+            return;
+        }
+
+        Class<?> javaType = type.getJavaType();
+        if (javaType == boolean.class) {
+            type.writeBoolean(output, toBooleanValue(value));
+        }
+        else if (javaType == long.class) {
+            writeLongObject(output, type, value);
+        }
+        else if (javaType == double.class) {
+            type.writeDouble(output, ((Number) value).doubleValue());
+        }
+        else if (javaType == Slice.class) {
+            writeSliceObject(output, type, value);
+        }
+        else if (javaType == Int128.class) {
+            DecimalType decimalType = (DecimalType) type;
+            decimalType.writeObject(output, Decimals.encodeScaledValue(coerceDecimalValue(type.getDisplayName(), toBigDecimalValue(value), decimalType), decimalType.getScale()));
+        }
+        else {
+            throw new IllegalArgumentException("Unsupported nested StarRocks value type: " + type);
+        }
+    }
+
+    private void writeArrayValue(BlockBuilder output, ArrayType arrayType, Object value)
+    {
+        if (!(value instanceof Iterable<?> iterable)) {
+            throw new IllegalArgumentException("Expected array value for " + arrayType + ": " + value);
+        }
+        ((ArrayBlockBuilder) output).buildEntry(elementBuilder -> {
+            for (Object element : iterable) {
+                writeObjectValue(elementBuilder, arrayType.getElementType(), element);
+            }
+        });
+    }
+
+    private void writeMapValue(BlockBuilder output, MapType mapType, Object value)
+    {
+        if (value instanceof Map<?, ?> map) {
+            ((MapBlockBuilder) output).buildEntry((keyBuilder, valueBuilder) -> {
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    writeObjectValue(keyBuilder, mapType.getKeyType(), entry.getKey());
+                    writeObjectValue(valueBuilder, mapType.getValueType(), entry.getValue());
+                }
+            });
+            return;
+        }
+        if (value instanceof Iterable<?> iterable) {
+            ((MapBlockBuilder) output).buildEntry((keyBuilder, valueBuilder) -> {
+                for (Object element : iterable) {
+                    if (element instanceof Map<?, ?> entry && entry.containsKey("key") && entry.containsKey("value")) {
+                        writeObjectValue(keyBuilder, mapType.getKeyType(), entry.get("key"));
+                        writeObjectValue(valueBuilder, mapType.getValueType(), entry.get("value"));
+                    }
+                }
+            });
+            return;
+        }
+        throw new IllegalArgumentException("Expected map value for " + mapType + ": " + value);
+    }
+
+    private void writeRowValue(BlockBuilder output, RowType rowType, Object value)
+    {
+        List<RowType.Field> fields = rowType.getFields();
+        if (value instanceof Map<?, ?> map) {
+            ((RowBlockBuilder) output).buildEntry(fieldBuilders -> {
+                for (int index = 0; index < fields.size(); index++) {
+                    RowType.Field field = fields.get(index);
+                    writeObjectValue(fieldBuilders.get(index), field.getType(), map.get(field.getName().orElse("field" + index)));
+                }
+            });
+            return;
+        }
+        if (value instanceof List<?> list) {
+            ((RowBlockBuilder) output).buildEntry(fieldBuilders -> {
+                for (int index = 0; index < fields.size(); index++) {
+                    Object fieldValue = index < list.size() ? list.get(index) : null;
+                    writeObjectValue(fieldBuilders.get(index), fields.get(index).getType(), fieldValue);
+                }
+            });
+            return;
+        }
+        throw new IllegalArgumentException("Expected row value for " + rowType + ": " + value);
+    }
+
     private void writeSliceValue(BlockBuilder output, Type type, FieldVector vector, int index)
     {
         if (type == VARBINARY) {
@@ -222,6 +335,112 @@ public class StarRocksArrowToPageConverter
             return;
         }
         type.writeSlice(output, value);
+    }
+
+    private static void writeLongObject(BlockBuilder output, Type type, Object value)
+    {
+        if (type == TINYINT || type == SMALLINT || type == INTEGER || type == BIGINT) {
+            type.writeLong(output, ((Number) value).longValue());
+            return;
+        }
+        if (type == REAL) {
+            type.writeLong(output, floatToRawIntBits(((Number) value).floatValue()));
+            return;
+        }
+        if (type == DATE) {
+            type.writeLong(output, toDateObject(value));
+            return;
+        }
+        if (type instanceof TimestampType timestampType && timestampType.isShort()) {
+            long epochMicros = value instanceof Number number
+                    ? number.longValue()
+                    : toTrinoTimestampMicros(parseTimestampText(value.toString()));
+            if (timestampType.getPrecision() == TIMESTAMP_MICROS.getPrecision()) {
+                type.writeLong(output, epochMicros);
+                return;
+            }
+            type.writeLong(output, round(epochMicros, TIMESTAMP_MICROS.getPrecision() - timestampType.getPrecision()));
+            return;
+        }
+        if (type instanceof DecimalType decimalType && decimalType.isShort()) {
+            decimalType.writeLong(output, encodeShortScaledValue(coerceDecimalValue(type.getDisplayName(), toBigDecimalValue(value), decimalType), decimalType.getScale()));
+            return;
+        }
+        throw new IllegalArgumentException("Unsupported nested StarRocks long value type: " + type);
+    }
+
+    private static void writeSliceObject(BlockBuilder output, Type type, Object value)
+    {
+        if (type == VARBINARY) {
+            type.writeSlice(output, wrappedBuffer(value instanceof byte[] bytes ? bytes : value.toString().getBytes(StandardCharsets.UTF_8)));
+            return;
+        }
+        if (type.getBaseName().equals(JSON)) {
+            String json = value instanceof CharSequence ? value.toString() : JSON_CODEC.toJson(toJsonCompatibleValue(value));
+            type.writeSlice(output, utf8Slice(json));
+            return;
+        }
+
+        Slice slice = utf8Slice(value instanceof Slice valueSlice ? valueSlice.toStringUtf8() : value.toString());
+        if (type instanceof CharType charType) {
+            type.writeSlice(output, truncateToLengthAndTrimSpaces(slice, charType));
+            return;
+        }
+        type.writeSlice(output, slice);
+    }
+
+    private static Object readComplexValue(FieldVector vector, int index)
+    {
+        if (vector instanceof VarCharVector || vector instanceof LargeVarCharVector) {
+            return JSON_CODEC.fromJson(readTextValue(vector, index));
+        }
+        Object value = vector.getObject(index);
+        if (value instanceof CharSequence) {
+            return JSON_CODEC.fromJson(value.toString());
+        }
+        if (value instanceof Slice slice) {
+            return JSON_CODEC.fromJson(slice.toStringUtf8());
+        }
+        return toJsonCompatibleValue(value);
+    }
+
+    private static boolean toBooleanValue(Object value)
+    {
+        if (value instanceof Boolean booleanValue) {
+            return booleanValue;
+        }
+        if (value instanceof Number number) {
+            return number.longValue() != 0;
+        }
+        return Boolean.parseBoolean(value.toString());
+    }
+
+    private static long toDateObject(Object value)
+    {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof LocalDate localDate) {
+            return localDate.toEpochDay();
+        }
+        return parseDateText(value.toString()).toEpochDay();
+    }
+
+    private static BigDecimal toBigDecimalValue(Object value)
+    {
+        if (value instanceof BigDecimal decimal) {
+            return decimal;
+        }
+        if (value instanceof BigInteger integer) {
+            return new BigDecimal(integer);
+        }
+        if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
+            return BigDecimal.valueOf(((Number) value).longValue());
+        }
+        if (value instanceof Number number) {
+            return BigDecimal.valueOf(number.doubleValue());
+        }
+        return new BigDecimal(value.toString());
     }
 
     private static boolean readBoolean(FieldVector vector, int index)
@@ -419,12 +638,12 @@ public class StarRocksArrowToPageConverter
         }
         if (value instanceof Map<?, ?> map) {
             return map.entrySet().stream()
-                    .collect(java.util.stream.Collectors.toMap(
+                    .collect(toMap(
                             entry -> entry.getKey().toString(),
                             entry -> toJsonCompatibleValue(entry.getValue())));
         }
         if (value instanceof Iterable<?> iterable) {
-            java.util.ArrayList<Object> values = new java.util.ArrayList<>();
+            ArrayList<Object> values = new ArrayList<>();
             for (Object element : iterable) {
                 values.add(toJsonCompatibleValue(element));
             }

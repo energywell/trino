@@ -21,6 +21,8 @@ import org.apache.arrow.adbc.core.AdbcDatabase;
 import org.apache.arrow.adbc.core.AdbcDriver;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.AdbcStatement;
+import org.apache.arrow.adbc.core.PartitionDescriptor;
+import org.apache.arrow.adbc.driver.flightsql.FlightSqlConnectionProperties;
 import org.apache.arrow.adbc.driver.flightsql.FlightSqlDriver;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.memory.BufferAllocator;
@@ -28,7 +30,12 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -45,6 +52,10 @@ public class AdbcStarRocksFlightSqlClient
 
     private final String flightSqlHost;
     private final int flightSqlPort;
+    private final boolean flightSqlTlsEnabled;
+    private final Optional<File> flightSqlTlsRootCertificate;
+    private final boolean flightSqlTlsSkipVerify;
+    private final Optional<String> flightSqlTlsOverrideHostname;
     private final Optional<String> username;
     private final Optional<String> password;
     private final StarRocksQueryBuilder queryBuilder;
@@ -57,9 +68,49 @@ public class AdbcStarRocksFlightSqlClient
                 .orElseGet(() -> inferFlightSqlHost(config.getJdbcUrl()
                         .orElseThrow(() -> new IllegalArgumentException("starrocks.jdbc-url must be set"))));
         this.flightSqlPort = config.getFlightSqlPort();
+        this.flightSqlTlsEnabled = config.isFlightSqlTlsEnabled();
+        this.flightSqlTlsRootCertificate = config.getFlightSqlTlsRootCertificate();
+        this.flightSqlTlsSkipVerify = config.isFlightSqlTlsSkipVerify();
+        this.flightSqlTlsOverrideHostname = config.getFlightSqlTlsOverrideHostname();
         this.username = config.getUsername();
         this.password = config.getPassword();
         this.queryBuilder = requireNonNull(queryBuilder, "queryBuilder is null");
+    }
+
+    @Override
+    public List<StarRocksSplit> getSplits(
+            ConnectorSession session,
+            StarRocksTableHandle tableHandle,
+            List<StarRocksColumnHandle> columns)
+    {
+        requireNonNull(tableHandle, "tableHandle is null");
+        requireNonNull(columns, "columns is null");
+
+        String sql = APPLICATION_NAME_PREFIX + queryBuilder.buildSelectSql(tableHandle, columns);
+        try (AdbcResources resources = openResources();
+                AdbcStatement statement = resources.connection().createStatement()) {
+            statement.setSqlQuery(sql);
+            List<StarRocksSplit> splits = new ArrayList<>();
+            for (PartitionDescriptor partitionDescriptor : statement.executePartitioned().getPartitionDescriptors()) {
+                ByteBuffer descriptor = partitionDescriptor.getDescriptor();
+                byte[] bytes = new byte[descriptor.remaining()];
+                descriptor.get(bytes);
+                splits.add(new StarRocksSplit(Optional.of(bytes)));
+            }
+            if (splits.isEmpty()) {
+                return List.of(new StarRocksSplit());
+            }
+            return List.copyOf(splits);
+        }
+        catch (AdbcException | RuntimeException e) {
+            if (e instanceof AdbcException) {
+                return List.of(new StarRocksSplit());
+            }
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to plan StarRocks Flight SQL splits", e);
+        }
+        catch (Exception e) {
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to close StarRocks Flight SQL split planning resources", e);
+        }
     }
 
     @Override
@@ -73,44 +124,100 @@ public class AdbcStarRocksFlightSqlClient
         requireNonNull(split, "split is null");
         requireNonNull(columns, "columns is null");
 
-        String sql = APPLICATION_NAME_PREFIX + queryBuilder.buildSelectSql(tableHandle, columns);
-        return openStream(sql);
+        if (split.partitionDescriptor().isPresent()) {
+            return openPartition(split.partitionDescriptor().orElseThrow());
+        }
+        return openQuery(APPLICATION_NAME_PREFIX + queryBuilder.buildSelectSql(tableHandle, columns));
     }
 
-    private StarRocksFlightSqlResult openStream(String sql)
+    private StarRocksFlightSqlResult openQuery(String sql)
     {
-        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-        AdbcDatabase database = null;
-        AdbcConnection connection = null;
+        AdbcResources resources = null;
         AdbcStatement statement = null;
         AdbcStatement.QueryResult queryResult = null;
         ArrowReader reader = null;
 
         try {
-            FlightSqlDriver driver = new FlightSqlDriver(allocator);
-            Map<String, Object> parameters = new HashMap<>();
-            AdbcDriver.PARAM_URI.set(parameters, Location.forGrpcInsecure(flightSqlHost, flightSqlPort).getUri().toString());
-            username.ifPresent(value -> AdbcDriver.PARAM_USERNAME.set(parameters, value));
-            password.ifPresent(value -> AdbcDriver.PARAM_PASSWORD.set(parameters, value));
-
-            database = driver.open(parameters);
-            connection = database.connect();
-            statement = connection.createStatement();
+            resources = openResources();
+            statement = resources.connection().createStatement();
             statement.setSqlQuery(sql);
             queryResult = statement.executeQuery();
             reader = queryResult.getReader();
-
-            return new AdbcResult(allocator, database, connection, statement, queryResult, reader);
+            return new AdbcResult(resources, statement, queryResult, reader);
         }
         catch (AdbcException | RuntimeException e) {
             closeQuietly(reader);
             closeQuietly(queryResult);
             closeQuietly(statement);
+            closeQuietly(resources);
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to execute StarRocks Flight SQL query", e);
+        }
+    }
+
+    private StarRocksFlightSqlResult openPartition(byte[] partitionDescriptor)
+    {
+        AdbcResources resources = null;
+        ArrowReader reader = null;
+
+        try {
+            resources = openResources();
+            reader = resources.connection().readPartition(ByteBuffer.wrap(partitionDescriptor));
+            return new AdbcResult(resources, null, null, reader);
+        }
+        catch (AdbcException | RuntimeException e) {
+            closeQuietly(reader);
+            closeQuietly(resources);
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to read StarRocks Flight SQL partition", e);
+        }
+    }
+
+    private AdbcResources openResources()
+            throws AdbcException
+    {
+        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        AdbcDatabase database = null;
+        AdbcConnection connection = null;
+        InputStream rootCertificate = null;
+        try {
+            FlightSqlDriver driver = new FlightSqlDriver(allocator);
+            Map<String, Object> parameters = new HashMap<>();
+            AdbcDriver.PARAM_URI.set(parameters, location().getUri().toString());
+            username.ifPresent(value -> AdbcDriver.PARAM_USERNAME.set(parameters, value));
+            password.ifPresent(value -> AdbcDriver.PARAM_PASSWORD.set(parameters, value));
+            FlightSqlConnectionProperties.TLS_SKIP_VERIFY.set(parameters, flightSqlTlsSkipVerify);
+            flightSqlTlsOverrideHostname.ifPresent(value -> FlightSqlConnectionProperties.TLS_OVERRIDE_HOSTNAME.set(parameters, value));
+            if (flightSqlTlsRootCertificate.isPresent()) {
+                rootCertificate = new FileInputStream(flightSqlTlsRootCertificate.orElseThrow());
+                FlightSqlConnectionProperties.TLS_ROOT_CERTS.set(parameters, rootCertificate);
+            }
+
+            database = driver.open(parameters);
+            connection = database.connect();
+            return new AdbcResources(allocator, database, connection);
+        }
+        catch (AdbcException | RuntimeException e) {
             closeQuietly(connection);
             closeQuietly(database);
             closeQuietly(allocator);
-            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to execute StarRocks Flight SQL query", e);
+            throw e;
         }
+        catch (Exception e) {
+            closeQuietly(connection);
+            closeQuietly(database);
+            closeQuietly(allocator);
+            throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to open StarRocks Flight SQL connection", e);
+        }
+        finally {
+            closeQuietly(rootCertificate);
+        }
+    }
+
+    private Location location()
+    {
+        if (flightSqlTlsEnabled) {
+            return Location.forGrpcTls(flightSqlHost, flightSqlPort);
+        }
+        return Location.forGrpcInsecure(flightSqlHost, flightSqlPort);
     }
 
     private static String inferFlightSqlHost(String jdbcUrl)
@@ -143,27 +250,21 @@ public class AdbcStarRocksFlightSqlClient
     private static final class AdbcResult
             implements StarRocksFlightSqlResult
     {
-        private final BufferAllocator allocator;
-        private final AdbcDatabase database;
-        private final AdbcConnection connection;
+        private final AdbcResources resources;
         private final AdbcStatement statement;
         private final AdbcStatement.QueryResult queryResult;
         private final ArrowReader reader;
         private final AtomicBoolean closed = new AtomicBoolean();
 
         private AdbcResult(
-                BufferAllocator allocator,
-                AdbcDatabase database,
-                AdbcConnection connection,
+                AdbcResources resources,
                 AdbcStatement statement,
                 AdbcStatement.QueryResult queryResult,
                 ArrowReader reader)
         {
-            this.allocator = requireNonNull(allocator, "allocator is null");
-            this.database = requireNonNull(database, "database is null");
-            this.connection = requireNonNull(connection, "connection is null");
-            this.statement = requireNonNull(statement, "statement is null");
-            this.queryResult = requireNonNull(queryResult, "queryResult is null");
+            this.resources = requireNonNull(resources, "resources is null");
+            this.statement = statement;
+            this.queryResult = queryResult;
             this.reader = requireNonNull(reader, "reader is null");
         }
 
@@ -200,7 +301,7 @@ public class AdbcStarRocksFlightSqlClient
                 return 0;
             }
             try {
-                return allocator.getAllocatedMemory();
+                return resources.allocator().getAllocatedMemory();
             }
             catch (RuntimeException ignored) {
                 return 0;
@@ -218,9 +319,7 @@ public class AdbcStarRocksFlightSqlClient
             failure = closeResource(failure, reader);
             failure = closeResource(failure, queryResult);
             failure = closeResource(failure, statement);
-            failure = closeResource(failure, connection);
-            failure = closeResource(failure, database);
-            failure = closeResource(failure, allocator);
+            failure = closeResource(failure, resources);
 
             if (failure != null) {
                 throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to close StarRocks Flight SQL result", failure);
@@ -229,6 +328,9 @@ public class AdbcStarRocksFlightSqlClient
 
         private static Exception closeResource(Exception failure, AutoCloseable closeable)
         {
+            if (closeable == null) {
+                return failure;
+            }
             try {
                 closeable.close();
             }
@@ -239,6 +341,29 @@ public class AdbcStarRocksFlightSqlClient
                 failure.addSuppressed(e);
             }
             return failure;
+        }
+    }
+
+    private record AdbcResources(BufferAllocator allocator, AdbcDatabase database, AdbcConnection connection)
+            implements AutoCloseable
+    {
+        private AdbcResources
+        {
+            requireNonNull(allocator, "allocator is null");
+            requireNonNull(database, "database is null");
+            requireNonNull(connection, "connection is null");
+        }
+
+        @Override
+        public void close()
+        {
+            try {
+                closeQuietly(connection);
+                closeQuietly(database);
+            }
+            finally {
+                closeQuietly(allocator);
+            }
         }
     }
 }

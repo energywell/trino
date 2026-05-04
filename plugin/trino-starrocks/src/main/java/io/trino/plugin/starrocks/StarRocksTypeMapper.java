@@ -14,13 +14,17 @@
 package io.trino.plugin.starrocks;
 
 import com.google.inject.Inject;
+import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.CharType;
+import io.trino.spi.type.MapType;
+import io.trino.spi.type.RowType;
 import io.trino.spi.type.StandardTypes;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeManager;
 import io.trino.spi.type.TypeSignature;
 import io.trino.spi.type.VarcharType;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
@@ -44,16 +48,19 @@ import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.spi.type.VarcharType.createVarcharType;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
+import static java.util.Objects.requireNonNull;
 
 public class StarRocksTypeMapper
 {
     private static final int MAX_STARROCKS_TIMESTAMP_PRECISION = 6;
 
+    private final TypeManager typeManager;
     private final Type jsonType;
 
     @Inject
     public StarRocksTypeMapper(TypeManager typeManager)
     {
+        this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.jsonType = typeManager.getType(new TypeSignature(StandardTypes.JSON));
     }
 
@@ -74,7 +81,10 @@ public class StarRocksTypeMapper
             case "CHAR" -> toCharType(column);
             case "VARCHAR" -> toVarcharType(column);
             case "JSON", "VARIANT" -> jsonType;
-            case "STRING", "TEXT", "BITMAP", "HLL", "PERCENTILE", "PERCENTILE_UNION", "ARRAY", "MAP", "STRUCT" -> createUnboundedVarcharType();
+            case "ARRAY" -> toArrayType(column).orElseGet(VarcharType::createUnboundedVarcharType);
+            case "MAP" -> toMapType(column).orElseGet(VarcharType::createUnboundedVarcharType);
+            case "STRUCT" -> toRowType(column).orElseGet(VarcharType::createUnboundedVarcharType);
+            case "STRING", "TEXT", "BITMAP", "HLL", "PERCENTILE", "PERCENTILE_UNION" -> createUnboundedVarcharType();
             case "BINARY", "VARBINARY" -> VARBINARY;
             case "DATE" -> DATE;
             case "DATETIME", "DATETIMEV2", "TIMESTAMP" -> createTimestampType(timestampPrecision(column));
@@ -127,6 +137,68 @@ public class StarRocksTypeMapper
             return createUnboundedVarcharType();
         }
         return createVarcharType(length);
+    }
+
+    private Optional<Type> toArrayType(StarRocksRemoteColumn column)
+    {
+        return angleBracketParameters(column).stream()
+                .findFirst()
+                .map(this::toNestedType)
+                .map(ArrayType::new);
+    }
+
+    private Optional<Type> toMapType(StarRocksRemoteColumn column)
+    {
+        List<String> parameters = angleBracketParameters(column);
+        if (parameters.size() != 2) {
+            return Optional.empty();
+        }
+        Type keyType = toNestedType(parameters.get(0));
+        Type valueType = toNestedType(parameters.get(1));
+        if (!keyType.isComparable()) {
+            return Optional.empty();
+        }
+        return Optional.of(new MapType(keyType, valueType, typeManager.getTypeOperators()));
+    }
+
+    private Optional<Type> toRowType(StarRocksRemoteColumn column)
+    {
+        List<String> fieldDeclarations = angleBracketParameters(column);
+        if (fieldDeclarations.isEmpty()) {
+            return Optional.empty();
+        }
+
+        List<RowType.Field> fields = new ArrayList<>(fieldDeclarations.size());
+        for (int index = 0; index < fieldDeclarations.size(); index++) {
+            String declaration = fieldDeclarations.get(index).trim();
+            int separator = declaration.indexOf(':');
+            if (separator < 0) {
+                separator = firstTopLevelWhitespace(declaration);
+            }
+
+            Optional<String> fieldName = Optional.of("field" + index);
+            String fieldTypeDeclaration = declaration;
+            if (separator > 0 && separator < declaration.length() - 1) {
+                fieldName = Optional.of(unquoteIdentifier(declaration.substring(0, separator).trim()));
+                fieldTypeDeclaration = declaration.substring(separator + 1).trim();
+            }
+
+            fields.add(new RowType.Field(fieldName, toNestedType(fieldTypeDeclaration)));
+        }
+        return Optional.of(RowType.from(fields));
+    }
+
+    private Type toNestedType(String typeDeclaration)
+    {
+        String trimmedDeclaration = typeDeclaration.trim();
+        return toTrinoType(new StarRocksRemoteColumn(
+                "$nested",
+                "$nested",
+                nestedTypeName(trimmedDeclaration),
+                Optional.empty(),
+                Optional.empty(),
+                1,
+                Optional.of(trimmedDeclaration)));
     }
 
     private static int timestampPrecision(StarRocksRemoteColumn column)
@@ -204,6 +276,89 @@ public class StarRocksTypeMapper
             return parenthesisStart;
         }
         return min(parenthesisStart, angleBracketStart);
+    }
+
+    private static List<String> angleBracketParameters(StarRocksRemoteColumn column)
+    {
+        String typeDeclaration = fullTypeDeclaration(column);
+        int parametersStart = typeDeclaration.indexOf('<');
+        int parametersEnd = typeDeclaration.lastIndexOf('>');
+        if (parametersStart < 0 || parametersEnd <= parametersStart) {
+            return List.of();
+        }
+        return splitTopLevel(typeDeclaration.substring(parametersStart + 1, parametersEnd), ',');
+    }
+
+    private static List<String> splitTopLevel(String value, char delimiter)
+    {
+        List<String> parts = new ArrayList<>();
+        int angleDepth = 0;
+        int parenthesisDepth = 0;
+        int start = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char current = value.charAt(index);
+            switch (current) {
+                case '<' -> angleDepth++;
+                case '>' -> angleDepth--;
+                case '(' -> parenthesisDepth++;
+                case ')' -> parenthesisDepth--;
+                default -> {
+                    if (current == delimiter && angleDepth == 0 && parenthesisDepth == 0) {
+                        addPart(parts, value.substring(start, index));
+                        start = index + 1;
+                    }
+                }
+            }
+        }
+        addPart(parts, value.substring(start));
+        return List.copyOf(parts);
+    }
+
+    private static void addPart(List<String> parts, String value)
+    {
+        String trimmed = value.trim();
+        if (!trimmed.isEmpty()) {
+            parts.add(trimmed);
+        }
+    }
+
+    private static String nestedTypeName(String typeDeclaration)
+    {
+        int parametersStart = firstTypeParameterStart(typeDeclaration);
+        if (parametersStart >= 0) {
+            return typeDeclaration.substring(0, parametersStart);
+        }
+        return typeDeclaration;
+    }
+
+    private static int firstTopLevelWhitespace(String value)
+    {
+        int angleDepth = 0;
+        int parenthesisDepth = 0;
+        for (int index = 0; index < value.length(); index++) {
+            char current = value.charAt(index);
+            switch (current) {
+                case '<' -> angleDepth++;
+                case '>' -> angleDepth--;
+                case '(' -> parenthesisDepth++;
+                case ')' -> parenthesisDepth--;
+                default -> {
+                    if (Character.isWhitespace(current) && angleDepth == 0 && parenthesisDepth == 0) {
+                        return index;
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static String unquoteIdentifier(String value)
+    {
+        if ((value.startsWith("`") && value.endsWith("`")) ||
+                (value.startsWith("\"") && value.endsWith("\""))) {
+            return value.substring(1, value.length() - 1);
+        }
+        return value;
     }
 
     private static List<Integer> typeParameters(StarRocksRemoteColumn column)

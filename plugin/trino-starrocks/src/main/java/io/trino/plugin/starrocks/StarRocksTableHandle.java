@@ -17,6 +17,7 @@ import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.TupleDomain;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
@@ -33,7 +34,8 @@ public record StarRocksTableHandle(
         TupleDomain<StarRocksColumnHandle> constraint,
         OptionalLong limit,
         List<StarRocksSortItem> sortOrder,
-        Optional<StarRocksAggregation> aggregation)
+        Optional<StarRocksAggregation> aggregation,
+        Optional<List<StarRocksColumnHandle>> projectedColumns)
         implements ConnectorTableHandle
 {
     public StarRocksTableHandle(
@@ -54,6 +56,7 @@ public record StarRocksTableHandle(
                 TupleDomain.all(),
                 OptionalLong.empty(),
                 List.of(),
+                Optional.empty(),
                 Optional.empty());
     }
 
@@ -69,6 +72,8 @@ public record StarRocksTableHandle(
         requireNonNull(limit, "limit is null");
         sortOrder = List.copyOf(requireNonNull(sortOrder, "sortOrder is null"));
         requireNonNull(aggregation, "aggregation is null");
+        projectedColumns = requireNonNull(projectedColumns, "projectedColumns is null")
+                .map(List::copyOf);
     }
 
     public SchemaTableName toSchemaTableName()
@@ -78,23 +83,37 @@ public record StarRocksTableHandle(
 
     public StarRocksTableHandle withConstraint(TupleDomain<StarRocksColumnHandle> constraint)
     {
-        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, limit, sortOrder, aggregation);
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, limit, sortOrder, aggregation, projectedColumns);
     }
 
     public StarRocksTableHandle withLimit(long limit)
     {
         OptionalLong newLimit = this.limit.isPresent() ? OptionalLong.of(Math.min(this.limit.getAsLong(), limit)) : OptionalLong.of(limit);
-        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, newLimit, sortOrder, aggregation);
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, newLimit, sortOrder, aggregation, projectedColumns);
     }
 
     public StarRocksTableHandle withTopN(long limit, List<StarRocksSortItem> sortOrder)
     {
         OptionalLong newLimit = this.limit.isPresent() ? OptionalLong.of(Math.min(this.limit.getAsLong(), limit)) : OptionalLong.of(limit);
-        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, newLimit, sortOrder, aggregation);
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, newLimit, sortOrder, aggregation, projectedColumns);
     }
 
     public StarRocksTableHandle withAggregation(StarRocksAggregation aggregation)
     {
-        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, OptionalLong.empty(), List.of(), Optional.of(aggregation));
+        List<StarRocksColumnHandle> projectedColumns = new ArrayList<>(aggregation.groupingColumns());
+        for (int index = 0; index < aggregation.aggregateColumns().size(); index++) {
+            StarRocksAggregateColumn aggregateColumn = aggregation.aggregateColumns().get(index);
+            projectedColumns.add(new StarRocksColumnHandle(
+                    aggregateColumn.columnName(),
+                    aggregateColumn.columnName(),
+                    aggregateColumn.type(),
+                    aggregation.groupingColumns().size() + index));
+        }
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, OptionalLong.empty(), List.of(), Optional.of(aggregation), Optional.of(projectedColumns));
+    }
+
+    public StarRocksTableHandle withProjectedColumns(List<StarRocksColumnHandle> projectedColumns)
+    {
+        return new StarRocksTableHandle(schemaName, tableName, remoteCatalogName, remoteSchemaName, remoteTableName, relationType, constraint, limit, sortOrder, aggregation, Optional.of(projectedColumns));
     }
 }

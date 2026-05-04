@@ -15,5 +15,20 @@ package io.trino.plugin.starrocks;
 
 import io.trino.spi.connector.ConnectorSplit;
 
-public record StarRocksSplit()
-        implements ConnectorSplit {}
+import java.util.Optional;
+
+import static java.util.Objects.requireNonNull;
+
+public record StarRocksSplit(Optional<byte[]> partitionDescriptor)
+        implements ConnectorSplit
+{
+    public StarRocksSplit()
+    {
+        this(Optional.empty());
+    }
+
+    public StarRocksSplit
+    {
+        requireNonNull(partitionDescriptor, "partitionDescriptor is null");
+    }
+}

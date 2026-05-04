@@ -72,6 +72,9 @@ final class TestStarRocksIntegrationSmokeTest
     {
         assertQuery("SELECT count(*) FROM starrocks.starrocks_test.events", "VALUES 3");
         assertQuery(
+                "SELECT sum(id), avg(id), min(name), max(created_at) FROM starrocks.starrocks_test.events WHERE id >= 2",
+                "VALUES (5, 2.5, 'beta', TIMESTAMP '2024-01-03 12:17:32')");
+        assertQuery(
                 "SELECT id, created_at FROM starrocks.starrocks_test.events ORDER BY id",
                 """
                 VALUES

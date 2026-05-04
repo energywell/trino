@@ -13,13 +13,14 @@
  */
 package io.trino.plugin.starrocks;
 
+import io.trino.spi.predicate.Domain;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static io.trino.spi.connector.SortOrder.ASC_NULLS_LAST;
-import static io.trino.spi.predicate.Domain.create;
 import static io.trino.spi.predicate.Range.range;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 import static io.trino.spi.predicate.ValueSet.ofRanges;
@@ -60,7 +61,7 @@ final class TestStarRocksQueryBuilder
         StarRocksQueryBuilder queryBuilder = new StarRocksQueryBuilder();
         StarRocksColumnHandle orderKey = new StarRocksColumnHandle("orderkey", "OrderKey", BIGINT, 0);
         StarRocksTableHandle tableHandle = new StarRocksTableHandle("sales", "orders", Optional.of("external_catalog"), "Sales", "Orders", StarRocksRelationType.TABLE)
-                .withConstraint(withColumnDomains(java.util.Map.of(orderKey, create(ofRanges(range(BIGINT, 10L, true, 20L, false)), false))))
+                .withConstraint(withColumnDomains(Map.of(orderKey, Domain.create(ofRanges(range(BIGINT, 10L, true, 20L, false)), false))))
                 .withTopN(5, List.of(new StarRocksSortItem("orderkey", "OrderKey", ASC_NULLS_LAST)));
 
         assertThat(queryBuilder.buildSelectSql(tableHandle, List.of(orderKey)))
