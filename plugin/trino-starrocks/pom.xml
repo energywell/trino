@@ -88,10 +88,6 @@
                 </exclusion>
                 <exclusion>
                     <groupId>io.grpc</groupId>
-                    <artifactId>grpc-netty</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
                     <artifactId>grpc-protobuf</artifactId>
                 </exclusion>
                 <exclusion>
@@ -189,7 +185,7 @@
 
         <dependency>
             <groupId>io.grpc</groupId>
-            <artifactId>grpc-netty-shaded</artifactId>
+            <artifactId>grpc-netty</artifactId>
             <scope>runtime</scope>
         </dependency>
 
@@ -213,10 +209,6 @@
                 <exclusion>
                     <groupId>io.grpc</groupId>
                     <artifactId>grpc-api</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.grpc</groupId>
-                    <artifactId>grpc-netty</artifactId>
                 </exclusion>
                 <exclusion>
                     <groupId>org.apache.arrow</groupId>

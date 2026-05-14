@@ -248,7 +248,7 @@ public final class StarRocksQueryBuilder
                 type == DOUBLE ||
                 type == DATE ||
                 type instanceof DecimalType ||
-                type instanceof TimestampType ||
+                (type instanceof TimestampType timestampType && timestampType.isShort()) ||
                 type instanceof VarcharType ||
                 type instanceof CharType;
     }
@@ -263,7 +263,7 @@ public final class StarRocksQueryBuilder
                 type == DOUBLE ||
                 type == DATE ||
                 type instanceof DecimalType ||
-                type instanceof TimestampType;
+                (type instanceof TimestampType timestampType && timestampType.isShort());
     }
 
     private static String toSqlLiteral(Type type, Object value)
@@ -317,6 +317,10 @@ public final class StarRocksQueryBuilder
 
     private static String quoteStringLiteral(String value)
     {
-        return "'" + value.replace("'", "''") + "'";
+        // StarRocks/MySQL default mode treats \ as an escape character inside string
+        // literals, so backslashes must be doubled. Escape backslashes before single
+        // quotes — otherwise the doubled single quotes (`''`) would themselves be
+        // re-escaped.
+        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'";
     }
 }
