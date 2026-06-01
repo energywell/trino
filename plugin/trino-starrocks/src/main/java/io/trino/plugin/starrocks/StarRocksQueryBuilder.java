@@ -290,7 +290,10 @@ public final class StarRocksQueryBuilder
             return Decimals.toString((Int128) value, decimalType.getScale());
         }
         if (type == DATE) {
-            return "DATE " + quoteStringLiteral(LocalDate.ofEpochDay((long) value).toString());
+            // StarRocks uses MySQL-derived syntax and rejects ANSI typed literals
+            // (DATE '...'). Emit an explicit CAST so the string is interpreted as a
+            // DATE rather than compared as a string.
+            return "CAST(" + quoteStringLiteral(LocalDate.ofEpochDay((long) value).toString()) + " AS DATE)";
         }
         if (type instanceof TimestampType timestampType && timestampType.isShort()) {
             long epochMicros = (long) value;
@@ -299,7 +302,9 @@ public final class StarRocksQueryBuilder
             LocalDateTime timestamp = Instant.ofEpochSecond(epochSeconds, microsOfSecond * 1_000)
                     .atZone(UTC)
                     .toLocalDateTime();
-            return "TIMESTAMP " + quoteStringLiteral(timestamp.format(TIMESTAMP_FORMATTER));
+            // StarRocks rejects ANSI typed literals (TIMESTAMP '...') and its datetime
+            // type is named DATETIME, not TIMESTAMP. Emit CAST(... AS DATETIME).
+            return "CAST(" + quoteStringLiteral(timestamp.format(TIMESTAMP_FORMATTER)) + " AS DATETIME)";
         }
         if (type instanceof VarcharType || type instanceof CharType || type.getBaseName().equals(JSON)) {
             return quoteStringLiteral(toTextValue(value));
