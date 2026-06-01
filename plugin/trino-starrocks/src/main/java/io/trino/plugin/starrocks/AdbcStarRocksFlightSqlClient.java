@@ -21,6 +21,7 @@ import org.apache.arrow.adbc.core.AdbcDatabase;
 import org.apache.arrow.adbc.core.AdbcDriver;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.AdbcStatement;
+import org.apache.arrow.adbc.core.AdbcStatusCode;
 import org.apache.arrow.adbc.core.PartitionDescriptor;
 import org.apache.arrow.adbc.driver.flightsql.FlightSqlConnectionProperties;
 import org.apache.arrow.adbc.driver.flightsql.FlightSqlDriver;
@@ -58,6 +59,7 @@ public class AdbcStarRocksFlightSqlClient
     private final Optional<String> flightSqlTlsOverrideHostname;
     private final Optional<String> username;
     private final Optional<String> password;
+    private final long flightSqlMaxAllocationBytes;
     private final StarRocksQueryBuilder queryBuilder;
 
     @Inject
@@ -74,6 +76,7 @@ public class AdbcStarRocksFlightSqlClient
         this.flightSqlTlsOverrideHostname = config.getFlightSqlTlsOverrideHostname();
         this.username = config.getUsername();
         this.password = config.getPassword();
+        this.flightSqlMaxAllocationBytes = config.getFlightSqlMaxAllocation().toBytes();
         this.queryBuilder = requireNonNull(queryBuilder, "queryBuilder is null");
     }
 
@@ -86,12 +89,29 @@ public class AdbcStarRocksFlightSqlClient
         requireNonNull(tableHandle, "tableHandle is null");
         requireNonNull(columns, "columns is null");
 
+        if (requiresSingleSplit(tableHandle)) {
+            return List.of(new StarRocksSplit());
+        }
+
         String sql = APPLICATION_NAME_PREFIX + queryBuilder.buildSelectSql(tableHandle, columns);
         try (AdbcResources resources = openResources();
                 AdbcStatement statement = resources.connection().createStatement()) {
             statement.setSqlQuery(sql);
             List<StarRocksSplit> splits = new ArrayList<>();
-            for (PartitionDescriptor partitionDescriptor : statement.executePartitioned().getPartitionDescriptors()) {
+            Iterable<PartitionDescriptor> partitionDescriptors;
+            try {
+                partitionDescriptors = statement.executePartitioned().getPartitionDescriptors();
+            }
+            catch (AdbcException e) {
+                if (!shouldFallbackToSingleSplit(e)) {
+                    throw e;
+                }
+                return List.of(new StarRocksSplit());
+            }
+            catch (UnsupportedOperationException e) {
+                return List.of(new StarRocksSplit());
+            }
+            for (PartitionDescriptor partitionDescriptor : partitionDescriptors) {
                 ByteBuffer descriptor = partitionDescriptor.getDescriptor();
                 byte[] bytes = new byte[descriptor.remaining()];
                 descriptor.get(bytes);
@@ -103,9 +123,6 @@ public class AdbcStarRocksFlightSqlClient
             return List.copyOf(splits);
         }
         catch (AdbcException | RuntimeException e) {
-            if (e instanceof AdbcException) {
-                return List.of(new StarRocksSplit());
-            }
             throw new TrinoException(GENERIC_INTERNAL_ERROR, "Failed to plan StarRocks Flight SQL splits", e);
         }
         catch (Exception e) {
@@ -174,7 +191,7 @@ public class AdbcStarRocksFlightSqlClient
     private AdbcResources openResources()
             throws AdbcException
     {
-        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        BufferAllocator allocator = new RootAllocator(flightSqlMaxAllocationBytes);
         AdbcDatabase database = null;
         AdbcConnection connection = null;
         InputStream rootCertificate = null;
@@ -225,13 +242,25 @@ public class AdbcStarRocksFlightSqlClient
         try {
             URI uri = URI.create(jdbcUrl.substring("jdbc:".length()));
             if (uri.getHost() == null || uri.getHost().isBlank()) {
-                throw new IllegalArgumentException("Unable to infer host from JDBC URL: " + jdbcUrl);
+                throw new IllegalArgumentException("Unable to infer host from configured StarRocks JDBC URL");
             }
             return uri.getHost();
         }
         catch (RuntimeException e) {
-            throw new IllegalArgumentException("Unable to infer StarRocks Flight SQL host from JDBC URL: " + jdbcUrl, e);
+            throw new IllegalArgumentException("Unable to infer StarRocks Flight SQL host from configured JDBC URL", e);
         }
+    }
+
+    static boolean shouldFallbackToSingleSplit(AdbcException exception)
+    {
+        return exception.getStatus() == AdbcStatusCode.NOT_IMPLEMENTED;
+    }
+
+    private static boolean requiresSingleSplit(StarRocksTableHandle tableHandle)
+    {
+        return tableHandle.aggregation().isPresent() ||
+                tableHandle.limit().isPresent() ||
+                !tableHandle.sortOrder().isEmpty();
     }
 
     private static void closeQuietly(AutoCloseable closeable)

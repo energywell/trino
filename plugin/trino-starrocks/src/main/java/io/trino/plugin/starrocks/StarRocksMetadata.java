@@ -42,6 +42,7 @@ import io.trino.spi.predicate.TupleDomain;
 import io.trino.spi.statistics.Estimate;
 import io.trino.spi.statistics.TableStatistics;
 import io.trino.spi.type.DecimalType;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 
 import java.util.ArrayList;
@@ -56,6 +57,7 @@ import java.util.OptionalLong;
 
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.DateType.DATE;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
@@ -187,7 +189,7 @@ public class StarRocksMetadata
     public Optional<ConstraintApplicationResult<ConnectorTableHandle>> applyFilter(ConnectorSession session, ConnectorTableHandle table, Constraint constraint)
     {
         StarRocksTableHandle handle = (StarRocksTableHandle) table;
-        if (handle.aggregation().isPresent()) {
+        if (handle.aggregation().isPresent() || handle.limit().isPresent() || !handle.sortOrder().isEmpty()) {
             return Optional.empty();
         }
         if (constraint.getSummary().isNone()) {
@@ -239,10 +241,10 @@ public class StarRocksMetadata
         if (sortOrder.isEmpty()) {
             return Optional.empty();
         }
-        if (!handle.sortOrder().isEmpty() && !handle.sortOrder().equals(sortOrder)) {
+        if (handle.sortOrder().equals(sortOrder) && handle.limit().isPresent() && handle.limit().getAsLong() <= topNCount) {
             return Optional.empty();
         }
-        if (handle.sortOrder().equals(sortOrder) && handle.limit().isPresent() && handle.limit().getAsLong() <= topNCount) {
+        if (handle.limit().isPresent() || !handle.sortOrder().isEmpty()) {
             return Optional.empty();
         }
         return Optional.of(new TopNApplicationResult<>(handle.withTopN(topNCount, sortOrder), true, false));
@@ -347,6 +349,9 @@ public class StarRocksMetadata
     {
         List<ColumnMetadata> columnMetadata = new ArrayList<>(columns.size());
         for (StarRocksRemoteColumn column : columns) {
+            if (!isReadableColumn(column)) {
+                continue;
+            }
             columnMetadata.add(new ColumnMetadata(column.columnName(), typeMapper.toTrinoType(column)));
         }
         return List.copyOf(columnMetadata);
@@ -356,6 +361,9 @@ public class StarRocksMetadata
     {
         List<StarRocksColumnHandle> columnHandles = new ArrayList<>(columns.size());
         for (StarRocksRemoteColumn column : columns) {
+            if (!isReadableColumn(column)) {
+                continue;
+            }
             columnHandles.add(new StarRocksColumnHandle(
                     column.columnName(),
                     column.remoteColumnName(),
@@ -365,12 +373,33 @@ public class StarRocksMetadata
         return List.copyOf(columnHandles);
     }
 
+    private static boolean isReadableColumn(StarRocksRemoteColumn column)
+    {
+        return !remoteBaseType(column).equals("HLL");
+    }
+
+    private static String remoteBaseType(StarRocksRemoteColumn column)
+    {
+        String typeDeclaration = column.typeDefinition()
+                .orElse(column.typeName())
+                .trim();
+        int parenthesisStart = typeDeclaration.indexOf('(');
+        int angleBracketStart = typeDeclaration.indexOf('<');
+        int typeParameterStart = parenthesisStart < 0 ? angleBracketStart : (angleBracketStart < 0 ? parenthesisStart : Math.min(parenthesisStart, angleBracketStart));
+        if (typeParameterStart >= 0) {
+            typeDeclaration = typeDeclaration.substring(0, typeParameterStart);
+        }
+        return typeDeclaration.trim()
+                .toUpperCase(Locale.ENGLISH)
+                .replace(' ', '_');
+    }
+
     private static List<StarRocksSortItem> toStarRocksSortOrder(List<SortItem> sortItems, Map<String, ColumnHandle> assignments)
     {
         List<StarRocksSortItem> sortOrder = new ArrayList<>(sortItems.size());
         for (SortItem sortItem : sortItems) {
             ColumnHandle columnHandle = assignments.get(sortItem.getName());
-            if (!(columnHandle instanceof StarRocksColumnHandle starRocksColumnHandle) || !starRocksColumnHandle.columnType().isOrderable()) {
+            if (!(columnHandle instanceof StarRocksColumnHandle starRocksColumnHandle) || !isTopNPushdownSupported(starRocksColumnHandle.columnType())) {
                 return List.of();
             }
             sortOrder.add(new StarRocksSortItem(starRocksColumnHandle.columnName(), starRocksColumnHandle.remoteColumnName(), sortItem.getSortOrder()));
@@ -404,10 +433,13 @@ public class StarRocksMetadata
         if (!(columnHandle instanceof StarRocksColumnHandle starRocksColumnHandle)) {
             return Optional.empty();
         }
-        if (List.of("avg", "sum").contains(functionName) && !isNumericAggregationSupported(starRocksColumnHandle.columnType())) {
+        if (functionName.equals("avg") && !isAverageAggregationSupported(starRocksColumnHandle.columnType())) {
             return Optional.empty();
         }
-        if (List.of("max", "min").contains(functionName) && !starRocksColumnHandle.columnType().isOrderable()) {
+        if (functionName.equals("sum") && !isSumAggregationSupported(starRocksColumnHandle.columnType())) {
+            return Optional.empty();
+        }
+        if (List.of("max", "min").contains(functionName) && !isMinMaxAggregationSupported(starRocksColumnHandle.columnType())) {
             return Optional.empty();
         }
 
@@ -440,15 +472,48 @@ public class StarRocksMetadata
         return Optional.empty();
     }
 
-    private static boolean isNumericAggregationSupported(Type type)
+    private static boolean isTopNPushdownSupported(Type type)
+    {
+        return isNumericType(type) ||
+                type == DATE ||
+                type instanceof TimestampType;
+    }
+
+    private static boolean isAverageAggregationSupported(Type type)
+    {
+        return isIntegerType(type) ||
+                type == REAL ||
+                type == DOUBLE;
+    }
+
+    private static boolean isSumAggregationSupported(Type type)
+    {
+        return isIntegerType(type) ||
+                type == REAL ||
+                type == DOUBLE;
+    }
+
+    private static boolean isMinMaxAggregationSupported(Type type)
+    {
+        return isNumericType(type) ||
+                type == DATE ||
+                type instanceof TimestampType;
+    }
+
+    private static boolean isNumericType(Type type)
+    {
+        return isIntegerType(type) ||
+                type == REAL ||
+                type == DOUBLE ||
+                type instanceof DecimalType;
+    }
+
+    private static boolean isIntegerType(Type type)
     {
         return type == TINYINT ||
                 type == SMALLINT ||
                 type == INTEGER ||
-                type == BIGINT ||
-                type == REAL ||
-                type == DOUBLE ||
-                type instanceof DecimalType;
+                type == BIGINT;
     }
 
     private static boolean containSameElements(List<StarRocksColumnHandle> left, List<StarRocksColumnHandle> right)

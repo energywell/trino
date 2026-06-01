@@ -13,9 +13,12 @@
  */
 package io.trino.plugin.starrocks;
 
+import io.grpc.netty.NettyChannelBuilder;
+import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.flight.impl.Flight;
 import org.junit.jupiter.api.Test;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 final class TestArrowFlightRuntimeCompatibility
@@ -25,5 +28,21 @@ final class TestArrowFlightRuntimeCompatibility
     {
         assertThatCode(Flight.Ticket::getDefaultInstance)
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void testGrpcNettyChannelBuilderClassInitializes()
+    {
+        assertThatCode(() -> NettyChannelBuilder.forAddress("localhost", 0).usePlaintext())
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void testOnlyUnsupportedPartitionPlanningFallsBackToSingleSplit()
+    {
+        assertThat(AdbcStarRocksFlightSqlClient.shouldFallbackToSingleSplit(AdbcException.notImplemented("partitioned execution is not supported")))
+                .isTrue();
+        assertThat(AdbcStarRocksFlightSqlClient.shouldFallbackToSingleSplit(AdbcException.invalidState("authentication failed")))
+                .isFalse();
     }
 }

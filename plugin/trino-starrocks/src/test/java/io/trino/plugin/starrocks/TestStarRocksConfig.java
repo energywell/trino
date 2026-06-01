@@ -13,6 +13,7 @@
  */
 package io.trino.plugin.starrocks;
 
+import io.airlift.units.DataSize;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
@@ -21,6 +22,7 @@ import java.util.Map;
 import static io.airlift.configuration.testing.ConfigAssertions.assertFullMapping;
 import static io.airlift.configuration.testing.ConfigAssertions.assertRecordedDefaults;
 import static io.airlift.configuration.testing.ConfigAssertions.recordDefaults;
+import static io.airlift.units.DataSize.Unit.MEGABYTE;
 
 final class TestStarRocksConfig
 {
@@ -37,7 +39,8 @@ final class TestStarRocksConfig
                 .setFlightSqlTlsEnabled(false)
                 .setFlightSqlTlsRootCertificate(null)
                 .setFlightSqlTlsSkipVerify(false)
-                .setFlightSqlTlsOverrideHostname(null));
+                .setFlightSqlTlsOverrideHostname(null)
+                .setFlightSqlMaxAllocation(DataSize.of(256, MEGABYTE)));
     }
 
     @Test
@@ -53,7 +56,8 @@ final class TestStarRocksConfig
                 Map.entry("starrocks.flight-sql.tls.enabled", "true"),
                 Map.entry("starrocks.flight-sql.tls.root-certificate", "/etc/trino/starrocks-ca.pem"),
                 Map.entry("starrocks.flight-sql.tls.skip-verify", "true"),
-                Map.entry("starrocks.flight-sql.tls.override-hostname", "fe.internal.example.net"));
+                Map.entry("starrocks.flight-sql.tls.override-hostname", "fe.internal.example.net"),
+                Map.entry("starrocks.flight-sql.max-allocation", "512MB"));
 
         StarRocksConfig expected = new StarRocksConfig()
                 .setJdbcUrl("jdbc:starrocks://fe.example.net:9030")
@@ -65,7 +69,8 @@ final class TestStarRocksConfig
                 .setFlightSqlTlsEnabled(true)
                 .setFlightSqlTlsRootCertificate(new File("/etc/trino/starrocks-ca.pem"))
                 .setFlightSqlTlsSkipVerify(true)
-                .setFlightSqlTlsOverrideHostname("fe.internal.example.net");
+                .setFlightSqlTlsOverrideHostname("fe.internal.example.net")
+                .setFlightSqlMaxAllocation(DataSize.of(512, MEGABYTE));
 
         assertFullMapping(properties, expected);
     }

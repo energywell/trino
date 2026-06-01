@@ -16,10 +16,14 @@ package io.trino.plugin.starrocks;
 import io.airlift.configuration.Config;
 import io.airlift.configuration.ConfigDescription;
 import io.airlift.configuration.ConfigSecuritySensitive;
+import io.airlift.units.DataSize;
+import io.airlift.units.MinDataSize;
 import jakarta.validation.constraints.Min;
 
 import java.io.File;
 import java.util.Optional;
+
+import static io.airlift.units.DataSize.Unit.MEGABYTE;
 
 public class StarRocksConfig
 {
@@ -33,6 +37,7 @@ public class StarRocksConfig
     private File flightSqlTlsRootCertificate;
     private boolean flightSqlTlsSkipVerify;
     private String flightSqlTlsOverrideHostname;
+    private DataSize flightSqlMaxAllocation = DataSize.of(256, MEGABYTE);
 
     public Optional<String> getJdbcUrl()
     {
@@ -162,6 +167,20 @@ public class StarRocksConfig
     public StarRocksConfig setFlightSqlTlsOverrideHostname(String flightSqlTlsOverrideHostname)
     {
         this.flightSqlTlsOverrideHostname = flightSqlTlsOverrideHostname;
+        return this;
+    }
+
+    @MinDataSize("1MB")
+    public DataSize getFlightSqlMaxAllocation()
+    {
+        return flightSqlMaxAllocation;
+    }
+
+    @Config("starrocks.flight-sql.max-allocation")
+    @ConfigDescription("Maximum Arrow memory allocation per StarRocks Flight SQL stream")
+    public StarRocksConfig setFlightSqlMaxAllocation(DataSize flightSqlMaxAllocation)
+    {
+        this.flightSqlMaxAllocation = flightSqlMaxAllocation;
         return this;
     }
 }

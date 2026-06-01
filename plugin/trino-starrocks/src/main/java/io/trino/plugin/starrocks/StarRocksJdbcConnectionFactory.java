@@ -34,8 +34,7 @@ public class StarRocksJdbcConnectionFactory
     @Inject
     public StarRocksJdbcConnectionFactory(StarRocksConfig config)
     {
-        this(
-                createDriver(),
+        this(createDriver(),
                 requireNonNull(config, "config is null").getJdbcUrl()
                         .orElseThrow(() -> new IllegalArgumentException("starrocks.jdbc-url must be set")),
                 createConnectionProperties(config));
@@ -69,7 +68,7 @@ public class StarRocksJdbcConnectionFactory
 
         Connection connection = driver.connect(jdbcUrl, properties);
         if (connection == null) {
-            throw new SQLException("StarRocks JDBC driver refused URL: " + jdbcUrl);
+            throw new SQLException("StarRocks JDBC driver refused configured URL");
         }
         connection.setReadOnly(true);
         return connection;

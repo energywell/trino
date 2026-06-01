@@ -70,36 +70,59 @@ final class TestJdbcStarRocksMetadataClient
                 () -> createResultSet(List.of()),
                 (_, _, _) -> List.of(
                         row(
-                                "COLUMN_NAME", "ignored_by_information_schema",
-                                "TYPE_NAME", "BIGINT",
-                                "COLUMN_SIZE", 20,
-                                "DECIMAL_DIGITS", null,
-                                "ORDINAL_POSITION", 1)),
+                                "COLUMN_NAME",
+                                "ignored_by_information_schema",
+                                "TYPE_NAME",
+                                "BIGINT",
+                                "COLUMN_SIZE",
+                                20,
+                                "DECIMAL_DIGITS",
+                                null,
+                                "ORDINAL_POSITION",
+                                1)),
                 preparedSql::add,
                 List.of(
                         List.of(row("TABLE_SCHEMA", "Analytics", "TABLE_NAME", "EventsView", "TABLE_TYPE", "VIEW")),
                         List.of(
                                 row(
-                                        "COLUMN_NAME", "event_id",
-                                        "DATA_TYPE", "BIGINT",
-                                        "COLUMN_TYPE", "bigint",
-                                        "COLUMN_SIZE", 20,
-                                        "DECIMAL_DIGITS", null,
-                                        "ORDINAL_POSITION", 1),
+                                        "COLUMN_NAME",
+                                        "event_id",
+                                        "DATA_TYPE",
+                                        "BIGINT",
+                                        "COLUMN_TYPE",
+                                        "bigint",
+                                        "COLUMN_SIZE",
+                                        20,
+                                        "DECIMAL_DIGITS",
+                                        null,
+                                        "ORDINAL_POSITION",
+                                        1),
                                 row(
-                                        "COLUMN_NAME", "created_at",
-                                        "DATA_TYPE", "DATETIME",
-                                        "COLUMN_TYPE", "datetimev2(3)",
-                                        "COLUMN_SIZE", null,
-                                        "DECIMAL_DIGITS", 3,
-                                        "ORDINAL_POSITION", 2),
+                                        "COLUMN_NAME",
+                                        "created_at",
+                                        "DATA_TYPE",
+                                        "DATETIME",
+                                        "COLUMN_TYPE",
+                                        "datetimev2(3)",
+                                        "COLUMN_SIZE",
+                                        null,
+                                        "DECIMAL_DIGITS",
+                                        3,
+                                        "ORDINAL_POSITION",
+                                        2),
                                 row(
-                                        "COLUMN_NAME", "largeint_summary",
-                                        "DATA_TYPE", "DECIMAL",
-                                        "COLUMN_TYPE", "largeint",
-                                        "COLUMN_SIZE", null,
-                                        "DECIMAL_DIGITS", null,
-                                        "ORDINAL_POSITION", 3))),
+                                        "COLUMN_NAME",
+                                        "largeint_summary",
+                                        "DATA_TYPE",
+                                        "DECIMAL",
+                                        "COLUMN_TYPE",
+                                        "largeint",
+                                        "COLUMN_SIZE",
+                                        null,
+                                        "DECIMAL_DIGITS",
+                                        null,
+                                        "ORDINAL_POSITION",
+                                        3))),
                 boundParameters));
 
         StarRocksRemoteTable table = client.getTable(SESSION, new SchemaTableName("analytics", "eventsview")).orElseThrow();
@@ -128,17 +151,27 @@ final class TestJdbcStarRocksMetadataClient
                 () -> createResultSet(List.of()),
                 (_, _, _) -> List.of(
                         row(
-                                "COLUMN_NAME", "metric_key",
-                                "TYPE_NAME", "BIGINT",
-                                "COLUMN_SIZE", 20,
-                                "DECIMAL_DIGITS", null,
-                                "ORDINAL_POSITION", 1),
+                                "COLUMN_NAME",
+                                "metric_key",
+                                "TYPE_NAME",
+                                "BIGINT",
+                                "COLUMN_SIZE",
+                                20,
+                                "DECIMAL_DIGITS",
+                                null,
+                                "ORDINAL_POSITION",
+                                1),
                         row(
-                                "COLUMN_NAME", "created_at",
-                                "TYPE_NAME", "DATETIME",
-                                "COLUMN_SIZE", null,
-                                "DECIMAL_DIGITS", 6,
-                                "ORDINAL_POSITION", 2)),
+                                "COLUMN_NAME",
+                                "created_at",
+                                "TYPE_NAME",
+                                "DATETIME",
+                                "COLUMN_SIZE",
+                                null,
+                                "DECIMAL_DIGITS",
+                                6,
+                                "ORDINAL_POSITION",
+                                2)),
                 preparedSql::add,
                 List.of(
                         List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "TABLE")),
@@ -173,12 +206,18 @@ final class TestJdbcStarRocksMetadataClient
                         List.of(
                                 List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "BASE TABLE")),
                                 List.of(row(
-                                        "COLUMN_NAME", "event_id",
-                                        "DATA_TYPE", "BIGINT",
-                                        "COLUMN_TYPE", "bigint",
-                                        "COLUMN_SIZE", 20,
-                                        "DECIMAL_DIGITS", null,
-                                        "ORDINAL_POSITION", 1))),
+                                        "COLUMN_NAME",
+                                        "event_id",
+                                        "DATA_TYPE",
+                                        "BIGINT",
+                                        "COLUMN_TYPE",
+                                        "bigint",
+                                        "COLUMN_SIZE",
+                                        20,
+                                        "DECIMAL_DIGITS",
+                                        null,
+                                        "ORDINAL_POSITION",
+                                        1))),
                         boundParameters),
                 new StarRocksConfig().setCatalogName("external_catalog"));
 
@@ -205,12 +244,10 @@ final class TestJdbcStarRocksMetadataClient
                                 List.of(row("TABLE_SCHEMA", "analytics", "TABLE_NAME", "events", "TABLE_TYPE", "TABLE")),
                                 List.of(),
                                 List.of(row(
-                                        "COLUMN_NAME", "event_id",
-                                        "DATA_TYPE", "BIGINT",
-                                        "COLUMN_TYPE", "bigint",
-                                        "COLUMN_SIZE", 20,
-                                        "DECIMAL_DIGITS", null,
-                                        "ORDINAL_POSITION", 1))),
+                                        "Field",
+                                        "event_id",
+                                        "Type",
+                                        "bigint"))),
                         boundParameters),
                 new StarRocksConfig().setCatalogName("external_catalog"));
 
@@ -220,9 +257,9 @@ final class TestJdbcStarRocksMetadataClient
         assertThat(table.columns()).extracting(StarRocksRemoteColumn::columnName)
                 .containsExactly("event_id");
         assertThat(preparedSql.get(1)).contains("TABLE_CATALOG = ?");
-        assertThat(preparedSql.get(2)).doesNotContain("TABLE_CATALOG = ?");
+        assertThat(preparedSql.get(2)).isEqualTo("SHOW FULL COLUMNS FROM `external_catalog`.`analytics`.`events`");
         assertThat(boundParameters.get(1)).containsExactly("external_catalog", "analytics", "events");
-        assertThat(boundParameters.get(2)).containsExactly("analytics", "events");
+        assertThat(boundParameters.get(2)).isEmpty();
     }
 
     @Test
@@ -238,17 +275,27 @@ final class TestJdbcStarRocksMetadataClient
                 () -> createResultSet(List.of()),
                 (_, _, _) -> List.of(
                         row(
-                                "COLUMN_NAME", "metric_key",
-                                "TYPE_NAME", "BIGINT",
-                                "COLUMN_SIZE", 20,
-                                "DECIMAL_DIGITS", null,
-                                "ORDINAL_POSITION", 1),
+                                "COLUMN_NAME",
+                                "metric_key",
+                                "TYPE_NAME",
+                                "BIGINT",
+                                "COLUMN_SIZE",
+                                20,
+                                "DECIMAL_DIGITS",
+                                null,
+                                "ORDINAL_POSITION",
+                                1),
                         row(
-                                "COLUMN_NAME", "created_at",
-                                "TYPE_NAME", "DATETIME",
-                                "COLUMN_SIZE", null,
-                                "DECIMAL_DIGITS", 6,
-                                "ORDINAL_POSITION", 2)),
+                                "COLUMN_NAME",
+                                "created_at",
+                                "TYPE_NAME",
+                                "DATETIME",
+                                "COLUMN_SIZE",
+                                null,
+                                "DECIMAL_DIGITS",
+                                6,
+                                "ORDINAL_POSITION",
+                                2)),
                 preparedSql::add,
                 rowsByStatement,
                 boundParameters));

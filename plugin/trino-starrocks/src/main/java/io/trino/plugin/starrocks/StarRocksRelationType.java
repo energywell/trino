@@ -16,5 +16,5 @@ package io.trino.plugin.starrocks;
 enum StarRocksRelationType
 {
     TABLE,
-    VIEW
+    VIEW,
 }

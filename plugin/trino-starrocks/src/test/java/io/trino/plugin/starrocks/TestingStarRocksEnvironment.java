@@ -315,7 +315,12 @@ final class TestingStarRocksEnvironment
         @Override
         public List<StarRocksSplit> getSplits(ConnectorSession session, StarRocksTableHandle tableHandle, List<StarRocksColumnHandle> columns)
         {
-            return List.of(new StarRocksSplit());
+            if (tableHandle.aggregation().isPresent() || tableHandle.limit().isPresent() || !tableHandle.sortOrder().isEmpty()) {
+                return List.of(new StarRocksSplit());
+            }
+            return List.of(
+                    new StarRocksSplit(Optional.of("0".getBytes(UTF_8))),
+                    new StarRocksSplit(Optional.of("1".getBytes(UTF_8))));
         }
 
         @Override
@@ -324,8 +329,24 @@ final class TestingStarRocksEnvironment
             lastRequest.set(new Request(tableHandle, columns));
 
             TestingTable table = tables.get(tableHandle.toSchemaTableName());
-            List<Map<String, Object>> rows = table == null ? List.of() : applyTableHandle(tableHandle, table.rows());
+            List<Map<String, Object>> rows = table == null ? List.of() : applySplit(split, applyTableHandle(tableHandle, table.rows()));
             return createResult(table, columns, rows);
+        }
+
+        private static List<Map<String, Object>> applySplit(StarRocksSplit split, List<Map<String, Object>> rows)
+        {
+            if (split.partitionDescriptor().isEmpty()) {
+                return rows;
+            }
+
+            int partition = Integer.parseInt(new String(split.partitionDescriptor().orElseThrow(), UTF_8));
+            List<Map<String, Object>> partitionRows = new ArrayList<>();
+            for (int index = 0; index < rows.size(); index++) {
+                if (index % 2 == partition) {
+                    partitionRows.add(rows.get(index));
+                }
+            }
+            return List.copyOf(partitionRows);
         }
 
         private static List<Map<String, Object>> applyTableHandle(StarRocksTableHandle tableHandle, List<Map<String, Object>> rows)
@@ -371,7 +392,8 @@ final class TestingStarRocksEnvironment
         private static List<Map<String, Object>> applyAggregation(StarRocksAggregation aggregation, List<Map<String, Object>> rows)
         {
             Map<List<Object>, List<Map<String, Object>>> groups = rows.stream()
-                    .collect(Collectors.groupingBy(row -> aggregation.groupingColumns().stream()
+                    .collect(Collectors.groupingBy(
+                            row -> aggregation.groupingColumns().stream()
                                     .map(column -> row.get(column.columnName()))
                                     .toList(),
                             LinkedHashMap::new,
@@ -563,7 +585,7 @@ final class TestingStarRocksEnvironment
             RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
             List<FieldVector> vectors = new ArrayList<>(columns.size());
             Map<String, StarRocksRemoteColumn> remoteColumns = table == null ? Map.of() : table.columns().stream()
-                    .collect(Collectors.toUnmodifiableMap(StarRocksRemoteColumn::columnName, column -> column));
+                                                                                          .collect(Collectors.toUnmodifiableMap(StarRocksRemoteColumn::columnName, column -> column));
 
             try {
                 for (StarRocksColumnHandle column : columns) {

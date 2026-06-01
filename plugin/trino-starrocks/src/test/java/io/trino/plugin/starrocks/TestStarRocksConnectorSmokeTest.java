@@ -83,37 +83,37 @@ final class TestStarRocksConnectorSmokeTest
     protected boolean hasBehavior(TestingConnectorBehavior connectorBehavior)
     {
         return switch (connectorBehavior) {
-            case SUPPORTS_TOPN_PUSHDOWN_WITH_VARCHAR -> true;
+            case SUPPORTS_TOPN_PUSHDOWN_WITH_VARCHAR -> false;
             case SUPPORTS_AGGREGATION_PUSHDOWN -> true;
             case SUPPORTS_ADD_COLUMN,
-                    SUPPORTS_ARRAY,
-                    SUPPORTS_COMMENT_ON_COLUMN,
-                    SUPPORTS_COMMENT_ON_TABLE,
-                    SUPPORTS_CREATE_MATERIALIZED_VIEW,
-                    SUPPORTS_CREATE_SCHEMA,
-                    SUPPORTS_CREATE_TABLE,
-                    SUPPORTS_CREATE_VIEW,
-                    SUPPORTS_DELETE,
-                    SUPPORTS_DYNAMIC_FILTER_PUSHDOWN,
-                    SUPPORTS_INSERT,
-                    SUPPORTS_JOIN_PUSHDOWN,
-                    SUPPORTS_MAP_TYPE,
-                    SUPPORTS_MERGE,
-                    SUPPORTS_NATIVE_QUERY,
-                    SUPPORTS_NOT_NULL_CONSTRAINT,
-                    SUPPORTS_PREDICATE_PUSHDOWN_WITH_VARCHAR_INEQUALITY,
-                    SUPPORTS_PREDICATE_EXPRESSION_PUSHDOWN,
-                    SUPPORTS_RENAME_COLUMN,
-                    SUPPORTS_RENAME_TABLE,
-                    SUPPORTS_ROW_TYPE,
-                    SUPPORTS_SET_COLUMN_TYPE,
-                    SUPPORTS_AGGREGATION_PUSHDOWN_COUNT_DISTINCT,
-                    SUPPORTS_UPDATE,
-                    SUPPORTS_AGGREGATION_PUSHDOWN_CORRELATION,
-                    SUPPORTS_AGGREGATION_PUSHDOWN_COVARIANCE,
-                    SUPPORTS_AGGREGATION_PUSHDOWN_REGRESSION,
-                    SUPPORTS_AGGREGATION_PUSHDOWN_STDDEV,
-                    SUPPORTS_AGGREGATION_PUSHDOWN_VARIANCE -> false;
+                 SUPPORTS_ARRAY,
+                 SUPPORTS_COMMENT_ON_COLUMN,
+                 SUPPORTS_COMMENT_ON_TABLE,
+                 SUPPORTS_CREATE_MATERIALIZED_VIEW,
+                 SUPPORTS_CREATE_SCHEMA,
+                 SUPPORTS_CREATE_TABLE,
+                 SUPPORTS_CREATE_VIEW,
+                 SUPPORTS_DELETE,
+                 SUPPORTS_DYNAMIC_FILTER_PUSHDOWN,
+                 SUPPORTS_INSERT,
+                 SUPPORTS_JOIN_PUSHDOWN,
+                 SUPPORTS_MAP_TYPE,
+                 SUPPORTS_MERGE,
+                 SUPPORTS_NATIVE_QUERY,
+                 SUPPORTS_NOT_NULL_CONSTRAINT,
+                 SUPPORTS_PREDICATE_PUSHDOWN_WITH_VARCHAR_INEQUALITY,
+                 SUPPORTS_PREDICATE_EXPRESSION_PUSHDOWN,
+                 SUPPORTS_RENAME_COLUMN,
+                 SUPPORTS_RENAME_TABLE,
+                 SUPPORTS_ROW_TYPE,
+                 SUPPORTS_SET_COLUMN_TYPE,
+                 SUPPORTS_AGGREGATION_PUSHDOWN_COUNT_DISTINCT,
+                 SUPPORTS_UPDATE,
+                 SUPPORTS_AGGREGATION_PUSHDOWN_CORRELATION,
+                 SUPPORTS_AGGREGATION_PUSHDOWN_COVARIANCE,
+                 SUPPORTS_AGGREGATION_PUSHDOWN_REGRESSION,
+                 SUPPORTS_AGGREGATION_PUSHDOWN_STDDEV,
+                 SUPPORTS_AGGREGATION_PUSHDOWN_VARIANCE -> false;
             default -> super.hasBehavior(connectorBehavior);
         };
     }
@@ -196,6 +196,10 @@ final class TestStarRocksConnectorSmokeTest
         assertThat(topNRequest.tableHandle().sortOrder()).hasSize(1);
         assertThat(topNRequest.tableHandle().limit()).hasValue(1);
 
+        assertQuery("SELECT name FROM starrocks.starrocks_test.events ORDER BY name LIMIT 1", "VALUES 'alpha'");
+        TestingStarRocksEnvironment.Request stringTopNRequest = environment.getLastRequest().orElseThrow();
+        assertThat(stringTopNRequest.tableHandle().sortOrder()).isEmpty();
+
         assertQuery("SELECT count(*) FROM starrocks.starrocks_test.events WHERE id >= 2", "VALUES 2");
         TestingStarRocksEnvironment.Request countRequest = environment.getLastRequest().orElseThrow();
         assertThat(countRequest.tableHandle().constraint().isAll()).isFalse();
@@ -211,12 +215,12 @@ final class TestStarRocksConnectorSmokeTest
     void testStarRocksAggregationPushdowns()
     {
         assertQuery(
-                "SELECT sum(id), avg(id), min(name), max(created_at) FROM starrocks.starrocks_test.events WHERE id >= 2",
-                "VALUES (5, 2.5, 'beta', TIMESTAMP '2024-01-03 12:17:32.500')");
+                "SELECT sum(id), avg(id), min(id), max(created_at) FROM starrocks.starrocks_test.events WHERE id >= 2",
+                "VALUES (5, 2.5, 2, TIMESTAMP '2024-01-03 12:17:32.500')");
         TestingStarRocksEnvironment.Request aggregateRequest = environment.getLastRequest().orElseThrow();
         assertThat(aggregateRequest.tableHandle().aggregation()).isPresent();
         assertThat(aggregateRequest.tableHandle().aggregation().orElseThrow().aggregateColumns())
                 .extracting(StarRocksAggregateColumn::expression)
-                .containsExactly("sum(`id`)", "avg(`id`)", "min(`name`)", "max(`created_at`)");
+                .containsExactly("sum(`id`)", "avg(`id`)", "min(`id`)", "max(`created_at`)");
     }
 }

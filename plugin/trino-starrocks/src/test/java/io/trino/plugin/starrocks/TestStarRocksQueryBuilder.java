@@ -14,17 +14,21 @@
 package io.trino.plugin.starrocks;
 
 import io.trino.spi.predicate.Domain;
+import io.trino.spi.predicate.ValueSet;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.spi.connector.SortOrder.ASC_NULLS_LAST;
 import static io.trino.spi.predicate.Range.range;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 import static io.trino.spi.predicate.ValueSet.ofRanges;
 import static io.trino.spi.type.BigintType.BIGINT;
+import static io.trino.spi.type.DoubleType.DOUBLE;
+import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.VarcharType.createVarcharType;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -80,5 +84,60 @@ final class TestStarRocksQueryBuilder
 
         assertThat(queryBuilder.buildSelectSql(tableHandle, List.of(aggregate)))
                 .isEqualTo("SELECT count(*) AS `_starrocks_agg_0` FROM `sales`.`orders`");
+    }
+
+    @Test
+    void testUnsupportedFloatingPointPredicateLiteralIsNotPushedDown()
+    {
+        StarRocksColumnHandle ratio = new StarRocksColumnHandle("ratio", "ratio", DOUBLE, 0);
+
+        assertThat(StarRocksQueryBuilder.buildColumnPredicate(ratio, Domain.singleValue(DOUBLE, Double.POSITIVE_INFINITY)))
+                .isEmpty();
+    }
+
+    @Test
+    void testNotEqualVarcharPushdown()
+    {
+        StarRocksColumnHandle source = new StarRocksColumnHandle("source", "Source", createVarcharType(50), 0);
+        // source != 'ecoflow', NULLs not allowed
+        Domain domain = Domain.create(ValueSet.of(createVarcharType(50), utf8Slice("ecoflow")).complement(), false);
+
+        assertThat(StarRocksQueryBuilder.buildColumnPredicate(source, domain))
+                .hasValue("`Source` != 'ecoflow'");
+    }
+
+    @Test
+    void testNotInVarcharPushdown()
+    {
+        StarRocksColumnHandle source = new StarRocksColumnHandle("source", "Source", createVarcharType(50), 0);
+        // source NOT IN ('alpha', 'beta'), NULLs not allowed
+        Domain domain = Domain.create(ValueSet.of(createVarcharType(50), utf8Slice("alpha"), utf8Slice("beta")).complement(), false);
+
+        assertThat(StarRocksQueryBuilder.buildColumnPredicate(source, domain))
+                .hasValue("`Source` NOT IN ('alpha', 'beta')");
+    }
+
+    @Test
+    void testNotEqualVarcharPushdownWithNullAllowed()
+    {
+        StarRocksColumnHandle source = new StarRocksColumnHandle("source", "Source", createVarcharType(50), 0);
+        // source != 'ecoflow' OR source IS NULL
+        Domain domain = Domain.create(ValueSet.of(createVarcharType(50), utf8Slice("ecoflow")).complement(), true);
+
+        assertThat(StarRocksQueryBuilder.buildColumnPredicate(source, domain))
+                .hasValue("(`Source` != 'ecoflow' OR `Source` IS NULL)");
+    }
+
+    @Test
+    void testTemporalPredicatesUseCast()
+    {
+        StarRocksColumnHandle created = new StarRocksColumnHandle("created", "Created", createTimestampType(0), 0);
+        Domain domain = Domain.create(ofRanges(range(createTimestampType(0), 1_700_000_000_000_000L, true, 1_800_000_000_000_000L, false)), false);
+
+        assertThat(StarRocksQueryBuilder.buildColumnPredicate(created, domain))
+                .hasValueSatisfying(sql -> assertThat(sql)
+                        .contains("CAST(")
+                        .contains("AS DATETIME)")
+                        .doesNotContain("TIMESTAMP '"));
     }
 }

@@ -105,7 +105,16 @@ public final class StarRocksQueryBuilder
     {
         requireNonNull(column, "column is null");
         requireNonNull(domain, "domain is null");
+        try {
+            return buildColumnPredicateUnchecked(column, domain);
+        }
+        catch (IllegalArgumentException _) {
+            return Optional.empty();
+        }
+    }
 
+    private static Optional<String> buildColumnPredicateUnchecked(StarRocksColumnHandle column, Domain domain)
+    {
         String columnExpression = quoteIdentifier(column.remoteColumnName());
         Type type = column.columnType();
         if (domain.isNone()) {
@@ -133,8 +142,8 @@ public final class StarRocksQueryBuilder
             String valuesPredicate = discreteValues.size() == 1
                     ? columnExpression + " = " + toSqlLiteral(type, discreteValues.getFirst())
                     : columnExpression + " IN (" + discreteValues.stream()
-                            .map(value -> toSqlLiteral(type, value))
-                            .collect(joining(", ")) + ")";
+                                                   .map(value -> toSqlLiteral(type, value))
+                                                   .collect(joining(", ")) + ")";
             if (domain.isNullAllowed()) {
                 return Optional.of("(" + valuesPredicate + " OR " + columnExpression + " IS NULL)");
             }
@@ -151,12 +160,33 @@ public final class StarRocksQueryBuilder
             String predicate = rangePredicates.size() == 1
                     ? rangePredicates.getFirst()
                     : rangePredicates.stream()
-                            .map(value -> "(" + value + ")")
-                            .collect(joining(" OR "));
+                      .map(value -> "(" + value + ")")
+                      .collect(joining(" OR "));
             if (domain.isNullAllowed()) {
                 predicate = predicate + " OR " + columnExpression + " IS NULL";
             }
             return Optional.of(predicate);
+        }
+        // != / NOT IN: the value set itself is not discrete (it is the complement of a
+        // discrete set), and range pushdown is disabled for this type (e.g. varchar,
+        // char, boolean). Push the negated form so StarRocks filters at the storage
+        // layer instead of Trino streaming the whole table and filtering locally.
+        ValueSet complement = values.complement();
+        if (complement.isDiscreteSet() && isDiscretePredicatePushdownSupported(type)) {
+            List<Object> excludedValues = complement.getDiscreteSet();
+            if (!excludedValues.isEmpty() && excludedValues.size() <= MAX_PUSHDOWN_DISCRETE_VALUES) {
+                String predicate = excludedValues.size() == 1
+                        ? columnExpression + " != " + toSqlLiteral(type, excludedValues.getFirst())
+                        : columnExpression + " NOT IN (" + excludedValues.stream()
+                                .map(value -> toSqlLiteral(type, value))
+                                .collect(joining(", ")) + ")";
+                // != / NOT IN exclude NULLs in SQL three-valued logic. If the domain
+                // allows NULL, re-include them to preserve Trino semantics.
+                if (domain.isNullAllowed()) {
+                    return Optional.of("(" + predicate + " OR " + columnExpression + " IS NULL)");
+                }
+                return Optional.of(predicate);
+            }
         }
         return Optional.empty();
     }
@@ -248,7 +278,7 @@ public final class StarRocksQueryBuilder
                 type == DOUBLE ||
                 type == DATE ||
                 type instanceof DecimalType ||
-                (type instanceof TimestampType timestampType && timestampType.isShort()) ||
+                type instanceof TimestampType ||
                 type instanceof VarcharType ||
                 type instanceof CharType;
     }
@@ -263,7 +293,7 @@ public final class StarRocksQueryBuilder
                 type == DOUBLE ||
                 type == DATE ||
                 type instanceof DecimalType ||
-                (type instanceof TimestampType timestampType && timestampType.isShort());
+                type instanceof TimestampType;
     }
 
     private static String toSqlLiteral(Type type, Object value)
@@ -278,10 +308,18 @@ public final class StarRocksQueryBuilder
             return value.toString();
         }
         if (type == REAL) {
-            return Float.toString(Float.intBitsToFloat(((Number) value).intValue()));
+            float realValue = Float.intBitsToFloat(((Number) value).intValue());
+            if (!Float.isFinite(realValue)) {
+                throw new IllegalArgumentException("Unsupported StarRocks REAL literal: " + realValue);
+            }
+            return Float.toString(realValue);
         }
         if (type == DOUBLE) {
-            return Double.toString(((Number) value).doubleValue());
+            double doubleValue = ((Number) value).doubleValue();
+            if (!Double.isFinite(doubleValue)) {
+                throw new IllegalArgumentException("Unsupported StarRocks DOUBLE literal: " + doubleValue);
+            }
+            return Double.toString(doubleValue);
         }
         if (type instanceof DecimalType decimalType) {
             if (decimalType.isShort()) {

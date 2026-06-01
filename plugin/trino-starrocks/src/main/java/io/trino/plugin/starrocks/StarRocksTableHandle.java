@@ -46,8 +46,7 @@ public record StarRocksTableHandle(
             String remoteTableName,
             StarRocksRelationType relationType)
     {
-        this(
-                schemaName,
+        this(schemaName,
                 tableName,
                 remoteCatalogName,
                 remoteSchemaName,

@@ -30,11 +30,11 @@ final class TestStarRocksPlugin
         Iterator<ConnectorFactory> factories = plugin.getConnectorFactories().iterator();
         ConnectorFactory factory = factories.next();
         factory.create(
-                "test",
-                Map.of(
-                        "bootstrap.quiet", "true",
-                        "starrocks.jdbc-url", "jdbc:starrocks://127.0.0.1:9030"),
-                new TestingConnectorContext())
+                        "test",
+                        Map.of(
+                                "bootstrap.quiet", "true",
+                                "starrocks.jdbc-url", "jdbc:starrocks://127.0.0.1:9030"),
+                        new TestingConnectorContext())
                 .shutdown();
     }
 }
